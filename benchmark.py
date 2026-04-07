@@ -79,29 +79,36 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     prompt = args.prompt
 
-    # Warm-up: tokenise prompt to count tokens
-    prompt_tokens = llm.tokenize(prompt.encode())
-    n_prompt_tokens = len(prompt_tokens)
-
     vram_before = get_vram_usage_mb()
 
-    # Prompt processing timing
-    pp_start = time.perf_counter()
+    # Run inference; llama-cpp-python exposes per-phase timings via output["timings"]
     output = llm(
         prompt,
         max_tokens=args.n_predict,
         echo=False,
     )
-    pp_end = time.perf_counter()
 
     vram_after = get_vram_usage_mb()
 
-    total_time = pp_end - pp_start
     generated_tokens = output["usage"]["completion_tokens"]
     prompt_eval_tokens = output["usage"]["prompt_tokens"]
 
-    gen_tps = generated_tokens / total_time if total_time > 0 else 0.0
-    prompt_tps = prompt_eval_tokens / total_time if total_time > 0 else 0.0
+    # Use per-phase timings when available (llama-cpp-python >= 0.2.x)
+    timings = output.get("timings", {})
+    prompt_ms = timings.get("prompt_ms", 0.0)
+    predicted_ms = timings.get("predicted_ms", 0.0)
+
+    if prompt_ms > 0 and predicted_ms > 0:
+        # Accurate per-phase rates from llama.cpp internal timers
+        prompt_tps = (prompt_eval_tokens / prompt_ms) * 1000.0
+        gen_tps = (generated_tokens / predicted_ms) * 1000.0
+    else:
+        # Fallback: use overall wall-clock time (less accurate but always available)
+        wall_time = timings.get("total_ms", 0.0) / 1000.0
+        if wall_time <= 0:
+            wall_time = 1.0  # prevent division by zero
+        gen_tps = generated_tokens / wall_time
+        prompt_tps = prompt_eval_tokens / wall_time
 
     model_name = Path(model_path).stem
     model_size_mb = get_model_size_mb(model_path)

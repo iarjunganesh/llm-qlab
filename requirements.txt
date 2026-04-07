@@ -1,5 +1,6 @@
-# PyTorch — install with CUDA 13.2 support:
-# pip install torch --index-url https://download.pytorch.org/whl/cu121
+# PyTorch — run this BEFORE 'pip install -r requirements.txt' to get CUDA support:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Then include torch here so other packages resolve the dependency correctly.
 torch
 
 # Hugging Face ecosystem
