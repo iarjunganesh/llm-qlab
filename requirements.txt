@@ -1,26 +1,14 @@
-# PyTorch — run this BEFORE 'pip install -r requirements.txt' to get CUDA support:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-# Then include torch here so other packages resolve the dependency correctly.
-torch
+# IMPORTANT: llama-cpp-python must be built from source for CUDA 13.2 / sm_120 (RTX 5070 series).
+# The PyPI wheel does not include sm_120 CUDA kernels.
+# See README "Source Build" instructions — do NOT just `pip install llama-cpp-python`.
+llama-cpp-python
 
-# Hugging Face ecosystem
-transformers
+# Hugging Face Hub — download GGUF models
 huggingface_hub
-accelerate
 
-# Quantization support
-bitsandbytes
-
-# GPU monitoring
-nvitop
-
-# Data & visualization
+# Data & visualization (compare_quants.py)
 pandas
 matplotlib
 
-# Utilities
-tqdm
-psutil
-
-# llama.cpp Python bindings (GGUF model support)
-llama-cpp-python
+# Optional: interactive GPU monitor CLI (run standalone: nvitop)
+nvitop
