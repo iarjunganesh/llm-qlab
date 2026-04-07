@@ -1,0 +1,25 @@
+# PyTorch — install with CUDA 13.2 support:
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch
+
+# Hugging Face ecosystem
+transformers
+huggingface_hub
+accelerate
+
+# Quantization support
+bitsandbytes
+
+# GPU monitoring
+nvitop
+
+# Data & visualization
+pandas
+matplotlib
+
+# Utilities
+tqdm
+psutil
+
+# llama.cpp Python bindings (GGUF model support)
+llama-cpp-python
