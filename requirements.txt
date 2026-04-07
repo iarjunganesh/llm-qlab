@@ -1,0 +1,26 @@
+# PyTorch — run this BEFORE 'pip install -r requirements.txt' to get CUDA support:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Then include torch here so other packages resolve the dependency correctly.
+torch
+
+# Hugging Face ecosystem
+transformers
+huggingface_hub
+accelerate
+
+# Quantization support
+bitsandbytes
+
+# GPU monitoring
+nvitop
+
+# Data & visualization
+pandas
+matplotlib
+
+# Utilities
+tqdm
+psutil
+
+# llama.cpp Python bindings (GGUF model support)
+llama-cpp-python
