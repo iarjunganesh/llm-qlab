@@ -82,11 +82,13 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     vram_before = get_vram_usage_mb()
 
     # Run inference; llama-cpp-python exposes per-phase timings via output["timings"]
+    infer_start = time.perf_counter()
     output = llm(
         prompt,
         max_tokens=args.n_predict,
         echo=False,
     )
+    infer_wall_time = time.perf_counter() - infer_start
 
     vram_after = get_vram_usage_mb()
 
@@ -103,12 +105,19 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         prompt_tps = (prompt_eval_tokens / prompt_ms) * 1000.0
         gen_tps = (generated_tokens / predicted_ms) * 1000.0
     else:
-        # Fallback: use overall wall-clock time (less accurate but always available)
+        # Fallback: use measured wall-clock inference time.
         wall_time = timings.get("total_ms", 0.0) / 1000.0
         if wall_time <= 0:
-            wall_time = 1.0  # prevent division by zero
+            wall_time = infer_wall_time
+        if wall_time <= 0:
+            wall_time = 1e-6  # prevent division by zero
         gen_tps = generated_tokens / wall_time
         prompt_tps = prompt_eval_tokens / wall_time
+
+    if vram_before >= 0 and vram_after >= 0:
+        vram_value = max(vram_before, vram_after)
+    else:
+        vram_value = -1.0
 
     model_name = Path(model_path).stem
     model_size_mb = get_model_size_mb(model_path)
@@ -120,7 +129,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "generated_tokens": generated_tokens,
         "prompt_tps": round(prompt_tps, 2),
         "gen_tps": round(gen_tps, 2),
-        "vram_mb": round(max(vram_before, vram_after), 1),
+        "vram_mb": round(vram_value, 1),
         "load_time_s": round(load_time, 2),
         "model_size_mb": round(model_size_mb, 1),
     }

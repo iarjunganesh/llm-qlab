@@ -31,5 +31,8 @@ Thumbs.db
 # Project-specific
 results/*.csv
 results/*.png
+!results/comparison.png
+results/*.log
 *.gguf
 models/
+.tmp/
