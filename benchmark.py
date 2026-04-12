@@ -49,6 +49,7 @@ def print_summary(result: dict) -> None:
     print(f"  Benchmark Summary — {result['quant_type']}")
     print("=" * 52)
     print(f"  Model            : {result['model_name']}")
+    print(f"  Model family     : {result['model_family']}")
     print(f"  Quant type       : {result['quant_type']}")
     print(f"  Prompt tokens    : {result['prompt_tokens']}")
     print(f"  Generated tokens : {result['generated_tokens']}")
@@ -56,6 +57,7 @@ def print_summary(result: dict) -> None:
     print(f"  Generate t/s     : {result['gen_tps']:.2f}")
     print(f"  VRAM used (MB)   : {result['vram_mb']:.1f}")
     print(f"  Load time (s)    : {result['load_time_s']:.2f}")
+    print(f"  TTFT (ms)        : {result['ttft_ms']:.2f}")
     print(f"  Model size (MB)  : {result['model_size_mb']:.1f}")
     print("=" * 52 + "\n")
 
@@ -81,19 +83,29 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     vram_before = get_vram_usage_mb()
 
-    # Run inference; llama-cpp-python exposes per-phase timings via output["timings"]
+    # Run inference in streaming mode to capture TTFT (time-to-first-token).
+    ttft_ms: float = -1.0
     infer_start = time.perf_counter()
-    output = llm(
-        prompt,
-        max_tokens=args.n_predict,
-        echo=False,
-    )
+    chunks = []
+    for chunk in llm(prompt, max_tokens=args.n_predict, stream=True, echo=False):
+        if ttft_ms < 0:
+            ttft_ms = (time.perf_counter() - infer_start) * 1000.0
+        chunks.append(chunk)
     infer_wall_time = time.perf_counter() - infer_start
 
     vram_after = get_vram_usage_mb()
 
-    generated_tokens = output["usage"]["completion_tokens"]
-    prompt_eval_tokens = output["usage"]["prompt_tokens"]
+    # The final chunk carries usage counts in llama-cpp-python streaming responses.
+    output = chunks[-1] if chunks else {}
+    generated_tokens = output.get("usage", {}).get("completion_tokens", 0)
+    prompt_eval_tokens = output.get("usage", {}).get("prompt_tokens", 0)
+    # Fallback: count generated tokens by summing chunk text character lengths when
+    # usage metadata is absent. Note: character count ≠ token count, so metrics
+    # derived from this value will be approximate.
+    if generated_tokens == 0 and chunks:
+        generated_tokens = sum(
+            len(c.get("choices", [{}])[0].get("text", "")) for c in chunks
+        )
 
     # Use per-phase timings when available (llama-cpp-python >= 0.2.x)
     timings = output.get("timings", {})
@@ -124,6 +136,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     result = {
         "model_name": model_name,
+        "model_family": args.model_family,
         "quant_type": args.quant_type,
         "prompt_tokens": prompt_eval_tokens,
         "generated_tokens": generated_tokens,
@@ -131,6 +144,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "gen_tps": round(gen_tps, 2),
         "vram_mb": round(vram_value, 1),
         "load_time_s": round(load_time, 2),
+        "ttft_ms": round(ttft_ms, 2),
         "model_size_mb": round(model_size_mb, 1),
     }
 
@@ -145,6 +159,7 @@ RESULTS_DIR = Path("results")
 CSV_PATH = RESULTS_DIR / "benchmark_results.csv"
 CSV_FIELDS = [
     "model_name",
+    "model_family",
     "quant_type",
     "prompt_tokens",
     "generated_tokens",
@@ -152,6 +167,7 @@ CSV_FIELDS = [
     "gen_tps",
     "vram_mb",
     "load_time_s",
+    "ttft_ms",
     "model_size_mb",
 ]
 
@@ -201,6 +217,11 @@ def parse_args() -> argparse.Namespace:
         "--quant-type",
         default="unknown",
         help="Label for the quantization type, e.g. Q4_K_M (used in results).",
+    )
+    parser.add_argument(
+        "--model-family",
+        default="unknown",
+        help="Model family label, e.g. llama2, mistral, phi3, gemma (used in results).",
     )
     return parser.parse_args()
 

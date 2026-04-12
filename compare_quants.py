@@ -7,8 +7,10 @@ and prints a markdown-formatted comparison table to stdout.
 
 Usage:
     python compare_quants.py
+    python compare_quants.py --group-by model_family
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -18,6 +20,7 @@ import pandas as pd
 RESULTS_DIR = Path("results")
 CSV_PATH = RESULTS_DIR / "benchmark_results.csv"
 OUTPUT_PNG = RESULTS_DIR / "comparison.png"
+OUTPUT_PNG_FAMILY = RESULTS_DIR / "comparison_by_family.png"
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +37,12 @@ def load_results() -> pd.DataFrame:
     if df.empty:
         print("[error] Results file is empty. Run benchmark.py first.")
         sys.exit(1)
+
+    # Backward-compat: fill columns added in newer schema versions.
+    if "model_family" not in df.columns:
+        df["model_family"] = "unknown"
+    if "ttft_ms" not in df.columns:
+        df["ttft_ms"] = -1.0
 
     return df
 
@@ -84,11 +93,75 @@ def plot_comparison(df: pd.DataFrame) -> None:
     print(f"Chart saved to {OUTPUT_PNG}")
 
 
+def plot_comparison_by_family(df: pd.DataFrame) -> None:
+    """Grouped bar chart: model families on X-axis, one bar per quant type."""
+    RESULTS_DIR.mkdir(exist_ok=True)
+
+    agg = (
+        df.groupby(["model_family", "quant_type"], sort=False)
+        .agg(gen_tps=("gen_tps", "mean"))
+        .reset_index()
+    )
+
+    families = agg["model_family"].unique().tolist()
+    quants = agg["quant_type"].unique().tolist()
+    n_families = len(families)
+    n_quants = len(quants)
+
+    bar_width = 0.8 / n_quants
+    x = range(n_families)
+
+    fig, ax = plt.subplots(figsize=(max(8, n_families * 2), 5))
+    fig.suptitle("Gen t/s by Model Family — llm-qlab", fontsize=14, fontweight="bold")
+
+    colors = plt.cm.tab10.colors  # type: ignore[attr-defined]
+    for i, quant in enumerate(quants):
+        subset = agg[agg["quant_type"] == quant]
+        # Align values to the families list (missing → 0)
+        values = [
+            subset.loc[subset["model_family"] == fam, "gen_tps"].iloc[0]
+            if fam in subset["model_family"].values else 0.0
+            for fam in families
+        ]
+        offset = (i - n_quants / 2) * bar_width + bar_width / 2
+        bars = ax.bar(
+            [xi + offset for xi in x],
+            values,
+            width=bar_width,
+            label=quant,
+            color=colors[i % len(colors)],
+            edgecolor="white",
+        )
+        for bar, v in zip(bars, values):
+            if v > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    v + 0.3,
+                    f"{v:.1f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
+
+    ax.set_xlabel("Model Family")
+    ax.set_ylabel("Tokens / second")
+    ax.set_title("Generation Speed by Model Family")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(families)
+    ax.legend(title="Quant type")
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_PNG_FAMILY, dpi=150)
+    print(f"Chart saved to {OUTPUT_PNG_FAMILY}")
+
+
 # ---------------------------------------------------------------------------
 # Markdown table
 # ---------------------------------------------------------------------------
 
 def print_markdown_table(df: pd.DataFrame) -> None:
+    has_ttft = (df["ttft_ms"] != -1.0).any()
+
     agg = (
         df.groupby("quant_type", sort=False)
         .agg(
@@ -96,29 +169,90 @@ def print_markdown_table(df: pd.DataFrame) -> None:
             prompt_tps=("prompt_tps", "mean"),
             vram_mb=("vram_mb", "mean"),
             load_time_s=("load_time_s", "mean"),
+            ttft_ms=("ttft_ms", "mean"),
             model_size_mb=("model_size_mb", "mean"),
         )
         .reset_index()
     )
 
-    header = (
-        "| Quant | Gen t/s | Prompt t/s | VRAM (MB) | Load (s) | Size (MB) |"
-    )
-    separator = "|-------|---------|------------|-----------|----------|-----------|"
+    if has_ttft:
+        header = "| Quant | Gen t/s | Prompt t/s | VRAM (MB) | Load (s) | TTFT (ms) | Size (MB) |"
+        separator = "|-------|---------|------------|-----------|----------|-----------|-----------|"
+    else:
+        header = "| Quant | Gen t/s | Prompt t/s | VRAM (MB) | Load (s) | Size (MB) |"
+        separator = "|-------|---------|------------|-----------|----------|-----------|"
 
     print("\n## Benchmark Results\n")
     print(header)
     print(separator)
     for _, row in agg.iterrows():
+        ttft_col = f"| {row['ttft_ms']:.2f} " if has_ttft else ""
         print(
             f"| {row['quant_type']} "
             f"| {row['gen_tps']:.2f} "
             f"| {row['prompt_tps']:.2f} "
             f"| {row['vram_mb']:.0f} "
             f"| {row['load_time_s']:.2f} "
+            f"{ttft_col}"
             f"| {row['model_size_mb']:.0f} |"
         )
     print()
+
+
+def print_markdown_table_by_family(df: pd.DataFrame) -> None:
+    has_ttft = (df["ttft_ms"] != -1.0).any()
+
+    agg = (
+        df.groupby(["model_family", "quant_type"], sort=False)
+        .agg(
+            gen_tps=("gen_tps", "mean"),
+            prompt_tps=("prompt_tps", "mean"),
+            vram_mb=("vram_mb", "mean"),
+            ttft_ms=("ttft_ms", "mean"),
+            model_size_mb=("model_size_mb", "mean"),
+        )
+        .reset_index()
+    )
+
+    if has_ttft:
+        header = "| Model Family | Quant | Gen t/s | Prompt t/s | VRAM (MB) | TTFT (ms) | Size (MB) |"
+        separator = "|--------------|-------|---------|------------|-----------|-----------|-----------|"
+    else:
+        header = "| Model Family | Quant | Gen t/s | Prompt t/s | VRAM (MB) | Size (MB) |"
+        separator = "|--------------|-------|---------|------------|-----------|-----------|"
+
+    print("\n## Benchmark Results by Model Family\n")
+    print(header)
+    print(separator)
+    for _, row in agg.iterrows():
+        ttft_col = f"| {row['ttft_ms']:.2f} " if has_ttft else ""
+        print(
+            f"| {row['model_family']} "
+            f"| {row['quant_type']} "
+            f"| {row['gen_tps']:.2f} "
+            f"| {row['prompt_tps']:.2f} "
+            f"| {row['vram_mb']:.0f} "
+            f"{ttft_col}"
+            f"| {row['model_size_mb']:.0f} |"
+        )
+    print()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare quantization benchmark results."
+    )
+    parser.add_argument(
+        "--group-by",
+        choices=["quant_type", "model_family"],
+        default="quant_type",
+        help="Group results by 'quant_type' (default) or 'model_family'.",
+    )
+    return parser.parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +260,15 @@ def print_markdown_table(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    args = parse_args()
     df = load_results()
-    plot_comparison(df)
-    print_markdown_table(df)
+
+    if args.group_by == "model_family":
+        plot_comparison_by_family(df)
+        print_markdown_table_by_family(df)
+    else:
+        plot_comparison(df)
+        print_markdown_table(df)
 
 
 if __name__ == "__main__":
