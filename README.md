@@ -116,14 +116,59 @@ python compare_quants.py
 
 | Script | Purpose | Key Args |
 |--------|---------|----------|
-| `benchmark.py` | Run inference benchmark | `--model`, `--quant-type`, `--n-predict`, `--n-gpu-layers`, `--prompt` |
-| `compare_quants.py` | Plot & compare results | reads `results/benchmark_results.csv` |
+| `benchmark.py` | Run inference benchmark | `--model`, `--quant-type`, `--model-family`, `--n-predict`, `--n-gpu-layers`, `--prompt` |
+| `compare_quants.py` | Plot & compare results | `--group-by` (`quant_type` \| `model_family`); reads `results/benchmark_results.csv` |
+| `offload_ladder.py` | Sweep n_gpu_layers and plot VRAM vs speed | `--model`, `--quant-type`, `--steps` |
 | `monitor_gpu.py` | Live GPU stats logger | `--interval`, `--output` |
 | `download_model.py` | Download GGUF models | `--model`, `--filename`, `--list` |
 
 ---
 
-## 📈 Benchmark Results
+## 🆕 New Features
+
+### ⏱️ TTFT — Time-to-First-Token
+
+`benchmark.py` now captures **time-to-first-token (TTFT)** in milliseconds alongside throughput metrics. TTFT is measured as the wall-clock time from the start of inference until the first generated chunk arrives, using llama-cpp-python's streaming API.
+
+The value is included in the CSV output (`ttft_ms` column) and printed in the benchmark summary:
+
+```
+  TTFT (ms)        : 42.17
+```
+
+### 📉 GPU Offload Ladder
+
+`offload_ladder.py` systematically varies `--n-gpu-layers` across a configurable set of steps, benchmarks the model at each level, and produces:
+
+- A summary table printed to stdout
+- `results/offload_ladder.csv` with per-step metrics
+- `results/offload_ladder.png` — dual-axis line plot (gen t/s vs. VRAM MB)
+
+```bash
+python offload_ladder.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M
+python offload_ladder.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M --steps 0,16,32,99
+```
+
+### 🏷️ Multi-Model Family Support
+
+`benchmark.py` now accepts a `--model-family` flag to tag results with the model family (e.g. `llama2`, `mistral`, `phi3`, `gemma`):
+
+```bash
+python benchmark.py --model models/mistral-7b-instruct.Q4_K_M.gguf --quant-type Q4_K_M --model-family mistral
+python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf     --quant-type Q4_K_M --model-family llama2
+```
+
+`compare_quants.py` gains a `--group-by` argument. When set to `model_family`, it generates a grouped bar chart saved to `results/comparison_by_family.png` and prints a markdown table grouped by model family:
+
+```bash
+python compare_quants.py --group-by model_family
+```
+
+> **Backward compatibility:** old CSV files without `model_family` or `ttft_ms` columns are handled gracefully — missing values are filled with `"unknown"` and `-1` respectively.
+
+---
+
+
 
 **Hardware:** NVIDIA RTX 5070 Laptop GPU (8 GB VRAM) · CUDA 13.2 · Driver 595.97  
 **Backend:** llama-cpp-python 0.3.20, built from source · Full GPU offload (`--n-gpu-layers 99`)  
@@ -149,12 +194,16 @@ llm-qlab/
 ├── requirements.txt
 ├── benchmark.py          # Main benchmark runner
 ├── compare_quants.py     # Comparison plots & table
+├── offload_ladder.py     # GPU offload ladder sweep
 ├── monitor_gpu.py        # Live GPU monitor
 ├── download_model.py     # GGUF model downloader
 ├── .gitignore
 └── results/
-    ├── benchmark_results.csv  # Benchmark output (ignored by git)
-    └── comparison.png         # Generated chart
+    ├── benchmark_results.csv       # Benchmark output (ignored by git)
+    ├── offload_ladder.csv          # Offload ladder output (ignored by git)
+    ├── comparison.png              # Generated chart
+    ├── comparison_by_family.png    # Family comparison chart (generated)
+    └── offload_ladder.png          # Offload ladder plot (generated)
 ```
 
 ---
