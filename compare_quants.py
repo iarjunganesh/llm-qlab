@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -21,6 +22,104 @@ RESULTS_DIR = Path("results")
 CSV_PATH = RESULTS_DIR / "benchmark_results.csv"
 OUTPUT_PNG = RESULTS_DIR / "comparison.png"
 OUTPUT_PNG_FAMILY = RESULTS_DIR / "comparison_by_family.png"
+
+CSV_FIELDS = [
+    "model_name",
+    "model_family",
+    "quant_type",
+    "prompt_tokens",
+    "generated_tokens",
+    "prompt_tps",
+    "gen_tps",
+    "vram_mb",
+    "load_time_s",
+    "ttft_ms",
+    "model_size_mb",
+]
+
+LEGACY_FIELDS_V1 = [
+    "model_name",
+    "quant_type",
+    "prompt_tokens",
+    "generated_tokens",
+    "prompt_tps",
+    "gen_tps",
+    "vram_mb",
+    "load_time_s",
+    "model_size_mb",
+]
+
+LEGACY_FIELDS_V2 = [
+    "model_name",
+    "model_family",
+    "quant_type",
+    "prompt_tokens",
+    "generated_tokens",
+    "prompt_tps",
+    "gen_tps",
+    "vram_mb",
+    "load_time_s",
+    "model_size_mb",
+]
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_row(values: list[str]) -> dict | None:
+    if len(values) == len(CSV_FIELDS):
+        row_map = dict(zip(CSV_FIELDS, values))
+    elif len(values) == len(LEGACY_FIELDS_V2):
+        row_map = dict(zip(LEGACY_FIELDS_V2, values))
+        row_map["ttft_ms"] = "-1"
+    elif len(values) == len(LEGACY_FIELDS_V1):
+        row_map = dict(zip(LEGACY_FIELDS_V1, values))
+        row_map["model_family"] = "unknown"
+        row_map["ttft_ms"] = "-1"
+    else:
+        return None
+
+    return {
+        "model_name": row_map.get("model_name", "unknown"),
+        "model_family": row_map.get("model_family", "unknown") or "unknown",
+        "quant_type": row_map.get("quant_type", "unknown") or "unknown",
+        "prompt_tokens": _safe_int(row_map.get("prompt_tokens", 0), 0),
+        "generated_tokens": _safe_int(row_map.get("generated_tokens", 0), 0),
+        "prompt_tps": _safe_float(row_map.get("prompt_tps", 0.0), 0.0),
+        "gen_tps": _safe_float(row_map.get("gen_tps", 0.0), 0.0),
+        "vram_mb": _safe_float(row_map.get("vram_mb", -1.0), -1.0),
+        "load_time_s": _safe_float(row_map.get("load_time_s", 0.0), 0.0),
+        "ttft_ms": _safe_float(row_map.get("ttft_ms", -1.0), -1.0),
+        "model_size_mb": _safe_float(row_map.get("model_size_mb", 0.0), 0.0),
+    }
+
+
+def _load_results_resilient() -> pd.DataFrame:
+    rows = []
+    with open(CSV_PATH, "r", newline="") as f:
+        reader = csv.reader(f)
+        all_rows = list(reader)
+
+    if len(all_rows) <= 1:
+        return pd.DataFrame(columns=CSV_FIELDS)
+
+    for raw in all_rows[1:]:
+        normalized = _normalize_row(raw)
+        if normalized is not None:
+            rows.append(normalized)
+
+    return pd.DataFrame(rows, columns=CSV_FIELDS)
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +132,10 @@ def load_results() -> pd.DataFrame:
         print("Run benchmark.py first to generate results.")
         sys.exit(1)
 
-    df = pd.read_csv(CSV_PATH)
+    try:
+        df = pd.read_csv(CSV_PATH)
+    except Exception:
+        df = _load_results_resilient()
     if df.empty:
         print("[error] Results file is empty. Run benchmark.py first.")
         sys.exit(1)

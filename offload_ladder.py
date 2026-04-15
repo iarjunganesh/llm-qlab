@@ -17,7 +17,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from benchmark import get_model_size_mb, get_vram_usage_mb
+from benchmark import get_vram_usage_mb
 
 try:
     from llama_cpp import Llama
@@ -85,16 +85,25 @@ def run_ladder_step(
 
     vram_after = get_vram_usage_mb()
 
+    generated_text = "".join(
+        c.get("choices", [{}])[0].get("text", "") for c in chunks
+    )
+
     output = chunks[-1] if chunks else {}
     generated_tokens = output.get("usage", {}).get("completion_tokens", 0)
     prompt_eval_tokens = output.get("usage", {}).get("prompt_tokens", 0)
-    # Fallback: count generated tokens by summing chunk text character lengths when
-    # usage metadata is absent. Note: character count ≠ token count, so metrics
-    # derived from this value will be approximate.
+
+    # Fallback to tokenizer-based counts when usage metadata is absent.
+    if prompt_eval_tokens == 0:
+        try:
+            prompt_eval_tokens = len(llm.tokenize(prompt.encode("utf-8"), add_bos=True))
+        except Exception:
+            prompt_eval_tokens = 0
     if generated_tokens == 0 and chunks:
-        generated_tokens = sum(
-            len(c.get("choices", [{}])[0].get("text", "")) for c in chunks
-        )
+        try:
+            generated_tokens = len(llm.tokenize(generated_text.encode("utf-8"), add_bos=False))
+        except Exception:
+            generated_tokens = 0
 
     timings = output.get("timings", {})
     prompt_ms = timings.get("prompt_ms", 0.0)
