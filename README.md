@@ -35,6 +35,7 @@ Benchmarks comparing the following quantization formats using **llama-cpp-python
 
 Metrics captured per run:
 - Tokens / second (prompt processing & generation)
+- Time-to-first-token (TTFT, ms)
 - VRAM usage (MB)
 - Model load time (seconds)
 - Model file size (MB)
@@ -87,15 +88,18 @@ huggingface-cli download TheBloke/Llama-2-7B-chat-GGUF llama-2-7b-chat.Q4_K_M.gg
 ### 3. Run a benchmark
 
 ```bash
-python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M --n-gpu-layers 99
+python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M --model-family llama2 --n-gpu-layers 99
 ```
 
 Run all three quantization levels:
 
 ```bash
-python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M --n-gpu-layers 99
-python benchmark.py --model models/llama-2-7b-chat.Q5_K_M.gguf --quant-type Q5_K_M --n-gpu-layers 99
-python benchmark.py --model models/llama-2-7b-chat.Q8_0.gguf   --quant-type Q8_0   --n-gpu-layers 99
+python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M --model-family llama2 --n-gpu-layers 99
+python benchmark.py --model models/llama-2-7b-chat.Q5_K_M.gguf --quant-type Q5_K_M --model-family llama2 --n-gpu-layers 99
+python benchmark.py --model models/llama-2-7b-chat.Q8_0.gguf   --quant-type Q8_0   --model-family llama2 --n-gpu-layers 99
+
+# Example: benchmark a second family
+python benchmark.py --model models/mistral-7b-instruct-v0.1.Q4_K_M.gguf --quant-type Q4_K_M --model-family mistral --n-gpu-layers 99
 ```
 
 ### 4. Monitor GPU in a separate terminal
@@ -154,7 +158,7 @@ python offload_ladder.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type
 `benchmark.py` now accepts a `--model-family` flag to tag results with the model family (e.g. `llama2`, `mistral`, `phi3`, `gemma`):
 
 ```bash
-python benchmark.py --model models/mistral-7b-instruct.Q4_K_M.gguf --quant-type Q4_K_M --model-family mistral
+python benchmark.py --model models/mistral-7b-instruct-v0.1.Q4_K_M.gguf --quant-type Q4_K_M --model-family mistral
 python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf     --quant-type Q4_K_M --model-family llama2
 ```
 
@@ -164,7 +168,7 @@ python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf     --quant-type 
 python compare_quants.py --group-by model_family
 ```
 
-> **Backward compatibility:** old CSV files without `model_family` or `ttft_ms` columns are handled gracefully — missing values are filled with `"unknown"` and `-1` respectively.
+> **Backward compatibility:** legacy benchmark CSV files are migrated to the latest schema when new benchmark rows are appended, and comparison loading remains resilient when older rows are present.
 
 ---
 
@@ -172,17 +176,30 @@ python compare_quants.py --group-by model_family
 
 **Hardware:** NVIDIA RTX 5070 Laptop GPU (8 GB VRAM) · CUDA 13.2 · Driver 595.97  
 **Backend:** llama-cpp-python 0.3.20, built from source · Full GPU offload (`--n-gpu-layers 99`)  
-**Prompt:** 113 tokens · **Generated:** 128 tokens
+**Prompt:** 16 tokens · **Generated:** 65 tokens
 
 ![Quantization Comparison](results/comparison.png)
 
-| Model | Quant | Gen (t/s) | Prompt (t/s) | VRAM (MB) | Load (s) | Size (MB) |
-|-------|-------|-----------|--------------|-----------|----------|-----------|
-| Llama-2-7B-Chat | Q4_K_M | 45.27 | 39.97 | 4376 | 6.01 | 3892 |
-| Llama-2-7B-Chat | Q5_K_M | 40.41 | 35.68 | 5030 | 3.45 | 4562 |
-| Llama-2-7B-Chat | Q8_0 | 32.67 | 28.84 | 7250 | 7.36 | 6829 |
+| Model Family | Quant | Gen (t/s) | Prompt (t/s) | TTFT (ms) | VRAM (MB) | Size (MB) |
+|--------------|-------|-----------|--------------|-----------|-----------|-----------|
+| llama2 | Q4_K_M | 48.27 | 11.88 | 86.94 | 4308 | 3892 |
+| llama2 | Q5_K_M | 43.69 | 10.75 | 77.88 | 4962 | 4562 |
+| llama2 | Q8_0 | 34.80 | 8.57 | 80.62 | 7182 | 6829 |
+| mistral | Q4_K_M | 46.83 | 11.53 | 75.57 | 4406 | 4166 |
+| mistral | Q5_K_M | 40.79 | 10.04 | 73.81 | 5118 | 4894 |
+| mistral | Q8_0 | 31.32 | 7.71 | 75.85 | 7516 | 7339 |
 
-> VRAM headroom on 8 GB: Q4 leaves ~3.7 GB free, Q5 ~3.1 GB, Q8 only ~0.9 GB. Keep headroom for KV cache.
+![Comparison by Family](results/comparison_by_family.png)
+
+| Offload | Gen (t/s) | Prompt (t/s) | TTFT (ms) | VRAM (MB) |
+|---------|-----------|--------------|-----------|-----------|
+| `n_gpu_layers=0` | 9.78 | 2.41 | 1301.80 | 288 |
+| `n_gpu_layers=20` | 19.70 | 4.85 | 470.32 | 2708 |
+| `n_gpu_layers=99` | 52.68 | 12.97 | 24.14 | 4308 |
+
+![GPU Offload Ladder](results/offload_ladder.png)
+
+> On this 8 GB GPU, full offload of 7B Q4/Q5 models leaves usable headroom, while Q8 runs close to the limit. TTFT improves dramatically as more layers move from CPU to GPU.
 
 ---
 
