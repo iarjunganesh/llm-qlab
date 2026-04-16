@@ -30,8 +30,7 @@ Thumbs.db
 
 # Project-specific
 results/*.csv
-results/*.png
-!results/comparison.png
+!results/*.png
 results/*.log
 *.gguf
 models/
