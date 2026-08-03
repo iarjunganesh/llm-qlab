@@ -2,12 +2,17 @@
 compare_quants.py — Compare quantization benchmark results.
 
 Reads results/benchmark_results.csv, produces comparison bar charts
-(tokens/sec and VRAM usage), saves them to results/comparison.png,
+(decode throughput and VRAM usage), saves them to results/comparison.png,
 and prints a markdown-formatted comparison table to stdout.
 
 Usage:
     python compare_quants.py
     python compare_quants.py --group-by model_family
+
+Rows whose metrics are unmeasured (-1) are excluded from aggregates rather
+than averaged in as zeros — a missing measurement must never quietly drag a
+reported number down. Rows written before the prefill-timing fix carry
+timing_source="legacy_invalid" and are reported separately.
 """
 
 import argparse
@@ -18,113 +23,27 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from results_schema import CSV_FIELDS, CSV_PATH, LEGACY_MARKER, normalize_row
+
 RESULTS_DIR = Path("results")
-CSV_PATH = RESULTS_DIR / "benchmark_results.csv"
 OUTPUT_PNG = RESULTS_DIR / "comparison.png"
 OUTPUT_PNG_FAMILY = RESULTS_DIR / "comparison_by_family.png"
 
-CSV_FIELDS = [
-    "model_name",
-    "model_family",
-    "quant_type",
-    "prompt_tokens",
-    "generated_tokens",
-    "prompt_tps",
-    "gen_tps",
-    "vram_mb",
-    "load_time_s",
-    "ttft_ms",
-    "model_size_mb",
-]
-
-LEGACY_FIELDS_V1 = [
-    "model_name",
-    "quant_type",
-    "prompt_tokens",
-    "generated_tokens",
-    "prompt_tps",
-    "gen_tps",
-    "vram_mb",
-    "load_time_s",
-    "model_size_mb",
-]
-
-LEGACY_FIELDS_V2 = [
-    "model_name",
-    "model_family",
-    "quant_type",
-    "prompt_tokens",
-    "generated_tokens",
-    "prompt_tps",
-    "gen_tps",
-    "vram_mb",
-    "load_time_s",
-    "model_size_mb",
-]
-
-
-def _safe_int(value: object, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_float(value: object, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalize_row(values: list[str]) -> dict | None:
-    if len(values) == len(CSV_FIELDS):
-        row_map = dict(zip(CSV_FIELDS, values))
-    elif len(values) == len(LEGACY_FIELDS_V2):
-        row_map = dict(zip(LEGACY_FIELDS_V2, values))
-        row_map["ttft_ms"] = "-1"
-    elif len(values) == len(LEGACY_FIELDS_V1):
-        row_map = dict(zip(LEGACY_FIELDS_V1, values))
-        row_map["model_family"] = "unknown"
-        row_map["ttft_ms"] = "-1"
-    else:
-        return None
-
-    return {
-        "model_name": row_map.get("model_name", "unknown"),
-        "model_family": row_map.get("model_family", "unknown") or "unknown",
-        "quant_type": row_map.get("quant_type", "unknown") or "unknown",
-        "prompt_tokens": _safe_int(row_map.get("prompt_tokens", 0), 0),
-        "generated_tokens": _safe_int(row_map.get("generated_tokens", 0), 0),
-        "prompt_tps": _safe_float(row_map.get("prompt_tps", 0.0), 0.0),
-        "gen_tps": _safe_float(row_map.get("gen_tps", 0.0), 0.0),
-        "vram_mb": _safe_float(row_map.get("vram_mb", -1.0), -1.0),
-        "load_time_s": _safe_float(row_map.get("load_time_s", 0.0), 0.0),
-        "ttft_ms": _safe_float(row_map.get("ttft_ms", -1.0), -1.0),
-        "model_size_mb": _safe_float(row_map.get("model_size_mb", 0.0), 0.0),
-    }
-
-
-def _load_results_resilient() -> pd.DataFrame:
-    rows = []
-    with open(CSV_PATH, "r", newline="") as f:
-        reader = csv.reader(f)
-        all_rows = list(reader)
-
-    if len(all_rows) <= 1:
-        return pd.DataFrame(columns=CSV_FIELDS)
-
-    for raw in all_rows[1:]:
-        normalized = _normalize_row(raw)
-        if normalized is not None:
-            rows.append(normalized)
-
-    return pd.DataFrame(rows, columns=CSV_FIELDS)
+# Schema handling is shared with benchmark.py — see results_schema.py.
 
 
 # ---------------------------------------------------------------------------
 # Load data
 # ---------------------------------------------------------------------------
+
+def _load_resilient() -> pd.DataFrame:
+    with open(CSV_PATH, "r", newline="") as f:
+        all_rows = list(csv.reader(f))
+    if len(all_rows) <= 1:
+        return pd.DataFrame(columns=CSV_FIELDS)
+    rows = [r for r in (normalize_row(raw) for raw in all_rows[1:]) if r is not None]
+    return pd.DataFrame(rows, columns=CSV_FIELDS)
+
 
 def load_results() -> pd.DataFrame:
     if not CSV_PATH.exists():
@@ -134,19 +53,50 @@ def load_results() -> pd.DataFrame:
 
     try:
         df = pd.read_csv(CSV_PATH)
+        if not set(CSV_FIELDS).issubset(df.columns):
+            df = _load_resilient()
     except Exception:
-        df = _load_results_resilient()
+        df = _load_resilient()
+
     if df.empty:
         print("[error] Results file is empty. Run benchmark.py first.")
         sys.exit(1)
 
-    # Backward-compat: fill columns added in newer schema versions.
-    if "model_family" not in df.columns:
-        df["model_family"] = "unknown"
-    if "ttft_ms" not in df.columns:
-        df["ttft_ms"] = -1.0
+    stale = df[df["timing_source"] == LEGACY_MARKER]
+    if not stale.empty:
+        print(
+            f"[warn] {len(stale)} row(s) predate the prefill-timing fix and have no "
+            "valid throughput. They are excluded from charts and tables — re-run "
+            "benchmark.py for those configurations."
+        )
 
     return df
+
+
+def _valid(series: pd.Series) -> pd.Series:
+    """Drop unmeasured sentinels so they cannot skew an aggregate."""
+    return series[series > 0]
+
+
+def _median_or_nan(series: pd.Series) -> float:
+    usable = _valid(series)
+    return usable.median() if not usable.empty else float("nan")
+
+
+def _aggregate(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    metrics = [
+        "decode_tps", "decode_tps_std", "prefill_tps", "prefill_tps_std",
+        "ttft_ms", "ttft_ms_std", "vram_delta_mb", "load_time_s", "model_size_mb",
+    ]
+    return (
+        df.groupby(keys, sort=False)
+        .agg({m: _median_or_nan for m in metrics})
+        .reset_index()
+    )
+
+
+def _fmt(value: float, decimals: int = 2) -> str:
+    return "n/a" if pd.isna(value) else f"{value:.{decimals}f}"
 
 
 # ---------------------------------------------------------------------------
@@ -155,40 +105,37 @@ def load_results() -> pd.DataFrame:
 
 def plot_comparison(df: pd.DataFrame) -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
+    agg = _aggregate(df, ["quant_type"])
 
-    # Aggregate: mean per quant_type
-    agg = (
-        df.groupby("quant_type", sort=False)
-        .agg(gen_tps=("gen_tps", "mean"), vram_mb=("vram_mb", "mean"))
-        .reset_index()
-    )
-
-    quant_labels = agg["quant_type"].tolist()
-    x = range(len(quant_labels))
+    labels = agg["quant_type"].tolist()
+    x = range(len(labels))
     bar_width = 0.5
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     fig.suptitle("LLM Quantization Comparison — llm-qlab", fontsize=14, fontweight="bold")
 
-    # --- Chart 1: Tokens/sec ---
-    axes[0].bar(x, agg["gen_tps"], width=bar_width, color="#4C9BE8", edgecolor="white")
-    axes[0].set_title("Generation Speed (tokens/sec)")
+    axes[0].bar(
+        x, agg["decode_tps"], width=bar_width, color="#4C9BE8", edgecolor="white",
+        yerr=agg["decode_tps_std"].fillna(0), capsize=4,
+    )
+    axes[0].set_title("Decode Speed (tokens/sec)")
     axes[0].set_xlabel("Quantization Format")
     axes[0].set_ylabel("Tokens / second")
     axes[0].set_xticks(list(x))
-    axes[0].set_xticklabels(quant_labels)
-    for i, v in enumerate(agg["gen_tps"]):
-        axes[0].text(i, v + 0.5, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
+    axes[0].set_xticklabels(labels)
+    for i, v in enumerate(agg["decode_tps"]):
+        if not pd.isna(v):
+            axes[0].text(i, v + 0.5, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
 
-    # --- Chart 2: VRAM usage ---
-    axes[1].bar(x, agg["vram_mb"], width=bar_width, color="#E8844C", edgecolor="white")
-    axes[1].set_title("VRAM Usage (MB)")
+    axes[1].bar(x, agg["vram_delta_mb"], width=bar_width, color="#E8844C", edgecolor="white")
+    axes[1].set_title("VRAM Attributable to Model (MB)")
     axes[1].set_xlabel("Quantization Format")
     axes[1].set_ylabel("VRAM (MB)")
     axes[1].set_xticks(list(x))
-    axes[1].set_xticklabels(quant_labels)
-    for i, v in enumerate(agg["vram_mb"]):
-        axes[1].text(i, v + 5, f"{v:.0f}", ha="center", va="bottom", fontsize=9)
+    axes[1].set_xticklabels(labels)
+    for i, v in enumerate(agg["vram_delta_mb"]):
+        if not pd.isna(v):
+            axes[1].text(i, v + 5, f"{v:.0f}", ha="center", va="bottom", fontsize=9)
 
     plt.tight_layout()
     plt.savefig(OUTPUT_PNG, dpi=150)
@@ -198,56 +145,40 @@ def plot_comparison(df: pd.DataFrame) -> None:
 def plot_comparison_by_family(df: pd.DataFrame) -> None:
     """Grouped bar chart: model families on X-axis, one bar per quant type."""
     RESULTS_DIR.mkdir(exist_ok=True)
-
-    agg = (
-        df.groupby(["model_family", "quant_type"], sort=False)
-        .agg(gen_tps=("gen_tps", "mean"))
-        .reset_index()
-    )
+    agg = _aggregate(df, ["model_family", "quant_type"])
 
     families = agg["model_family"].unique().tolist()
     quants = agg["quant_type"].unique().tolist()
-    n_families = len(families)
-    n_quants = len(quants)
+    bar_width = 0.8 / len(quants)
+    x = range(len(families))
 
-    bar_width = 0.8 / n_quants
-    x = range(n_families)
-
-    fig, ax = plt.subplots(figsize=(max(8, n_families * 2), 5))
-    fig.suptitle("Gen t/s by Model Family — llm-qlab", fontsize=14, fontweight="bold")
+    fig, ax = plt.subplots(figsize=(max(8, len(families) * 2), 5))
+    fig.suptitle("Decode t/s by Model Family — llm-qlab", fontsize=14, fontweight="bold")
 
     colors = plt.cm.tab10.colors  # type: ignore[attr-defined]
     for i, quant in enumerate(quants):
         subset = agg[agg["quant_type"] == quant]
-        # Align values to the families list (missing → 0)
-        values = [
-            subset.loc[subset["model_family"] == fam, "gen_tps"].iloc[0]
-            if fam in subset["model_family"].values else 0.0
-            for fam in families
-        ]
-        offset = (i - n_quants / 2) * bar_width + bar_width / 2
+        values, errors = [], []
+        for fam in families:
+            match = subset.loc[subset["model_family"] == fam, "decode_tps"]
+            err = subset.loc[subset["model_family"] == fam, "decode_tps_std"]
+            values.append(0.0 if match.empty or pd.isna(match.iloc[0]) else match.iloc[0])
+            errors.append(0.0 if err.empty or pd.isna(err.iloc[0]) else err.iloc[0])
+
+        offset = (i - len(quants) / 2) * bar_width + bar_width / 2
         bars = ax.bar(
-            [xi + offset for xi in x],
-            values,
-            width=bar_width,
-            label=quant,
-            color=colors[i % len(colors)],
-            edgecolor="white",
+            [xi + offset for xi in x], values, width=bar_width, label=quant,
+            color=colors[i % len(colors)], edgecolor="white",
+            yerr=errors, capsize=3,
         )
         for bar, v in zip(bars, values):
             if v > 0:
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    v + 0.3,
-                    f"{v:.1f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=7,
-                )
+                ax.text(bar.get_x() + bar.get_width() / 2, v + 0.3,
+                        f"{v:.1f}", ha="center", va="bottom", fontsize=7)
 
     ax.set_xlabel("Model Family")
     ax.set_ylabel("Tokens / second")
-    ax.set_title("Generation Speed by Model Family")
+    ax.set_title("Decode Speed by Model Family")
     ax.set_xticks(list(x))
     ax.set_xticklabels(families)
     ax.legend(title="Quant type")
@@ -258,84 +189,41 @@ def plot_comparison_by_family(df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Markdown table
+# Markdown tables
 # ---------------------------------------------------------------------------
 
 def print_markdown_table(df: pd.DataFrame) -> None:
-    has_ttft = (df["ttft_ms"] != -1.0).any()
-
-    agg = (
-        df.groupby("quant_type", sort=False)
-        .agg(
-            gen_tps=("gen_tps", "mean"),
-            prompt_tps=("prompt_tps", "mean"),
-            vram_mb=("vram_mb", "mean"),
-            load_time_s=("load_time_s", "mean"),
-            ttft_ms=("ttft_ms", "mean"),
-            model_size_mb=("model_size_mb", "mean"),
-        )
-        .reset_index()
-    )
-
-    if has_ttft:
-        header = "| Quant | Gen t/s | Prompt t/s | VRAM (MB) | Load (s) | TTFT (ms) | Size (MB) |"
-        separator = "|-------|---------|------------|-----------|----------|-----------|-----------|"
-    else:
-        header = "| Quant | Gen t/s | Prompt t/s | VRAM (MB) | Load (s) | Size (MB) |"
-        separator = "|-------|---------|------------|-----------|----------|-----------|"
-
+    agg = _aggregate(df, ["quant_type"])
     print("\n## Benchmark Results\n")
-    print(header)
-    print(separator)
+    print("| Quant | Decode t/s | Prefill t/s | TTFT (ms) | VRAM (MB) | Load (s) | Size (MB) |")
+    print("|-------|------------|-------------|-----------|-----------|----------|-----------|")
     for _, row in agg.iterrows():
-        ttft_col = f"| {row['ttft_ms']:.2f} " if has_ttft else ""
         print(
             f"| {row['quant_type']} "
-            f"| {row['gen_tps']:.2f} "
-            f"| {row['prompt_tps']:.2f} "
-            f"| {row['vram_mb']:.0f} "
-            f"| {row['load_time_s']:.2f} "
-            f"{ttft_col}"
-            f"| {row['model_size_mb']:.0f} |"
+            f"| {_fmt(row['decode_tps'])} "
+            f"| {_fmt(row['prefill_tps'])} "
+            f"| {_fmt(row['ttft_ms'])} "
+            f"| {_fmt(row['vram_delta_mb'], 0)} "
+            f"| {_fmt(row['load_time_s'])} "
+            f"| {_fmt(row['model_size_mb'], 0)} |"
         )
     print()
 
 
 def print_markdown_table_by_family(df: pd.DataFrame) -> None:
-    has_ttft = (df["ttft_ms"] != -1.0).any()
-
-    agg = (
-        df.groupby(["model_family", "quant_type"], sort=False)
-        .agg(
-            gen_tps=("gen_tps", "mean"),
-            prompt_tps=("prompt_tps", "mean"),
-            vram_mb=("vram_mb", "mean"),
-            ttft_ms=("ttft_ms", "mean"),
-            model_size_mb=("model_size_mb", "mean"),
-        )
-        .reset_index()
-    )
-
-    if has_ttft:
-        header = "| Model Family | Quant | Gen t/s | Prompt t/s | VRAM (MB) | TTFT (ms) | Size (MB) |"
-        separator = "|--------------|-------|---------|------------|-----------|-----------|-----------|"
-    else:
-        header = "| Model Family | Quant | Gen t/s | Prompt t/s | VRAM (MB) | Size (MB) |"
-        separator = "|--------------|-------|---------|------------|-----------|-----------|"
-
+    agg = _aggregate(df, ["model_family", "quant_type"])
     print("\n## Benchmark Results by Model Family\n")
-    print(header)
-    print(separator)
+    print("| Model Family | Quant | Decode t/s | Prefill t/s | TTFT (ms) | VRAM (MB) | Size (MB) |")
+    print("|--------------|-------|------------|-------------|-----------|-----------|-----------|")
     for _, row in agg.iterrows():
-        ttft_col = f"| {row['ttft_ms']:.2f} " if has_ttft else ""
         print(
             f"| {row['model_family']} "
             f"| {row['quant_type']} "
-            f"| {row['gen_tps']:.2f} "
-            f"| {row['prompt_tps']:.2f} "
-            f"| {row['vram_mb']:.0f} "
-            f"{ttft_col}"
-            f"| {row['model_size_mb']:.0f} |"
+            f"| {_fmt(row['decode_tps'])} "
+            f"| {_fmt(row['prefill_tps'])} "
+            f"| {_fmt(row['ttft_ms'])} "
+            f"| {_fmt(row['vram_delta_mb'], 0)} "
+            f"| {_fmt(row['model_size_mb'], 0)} |"
         )
     print()
 
@@ -345,9 +233,7 @@ def print_markdown_table_by_family(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Compare quantization benchmark results."
-    )
+    parser = argparse.ArgumentParser(description="Compare quantization benchmark results.")
     parser.add_argument(
         "--group-by",
         choices=["quant_type", "model_family"],
@@ -357,13 +243,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     args = parse_args()
     df = load_results()
+    df = df[df["timing_source"] != LEGACY_MARKER]
+    if df.empty:
+        print("[error] No rows with valid timing data. Re-run benchmark.py.")
+        sys.exit(1)
 
     if args.group_by == "model_family":
         plot_comparison_by_family(df)

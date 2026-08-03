@@ -6,7 +6,24 @@
 ![CUDA](https://img.shields.io/badge/CUDA-13.2-green?logo=nvidia)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-A collection of Python scripts for benchmarking quantized large language models (LLMs) on consumer-grade NVIDIA GPUs. Track inference speed, VRAM usage, and quality trade-offs across different quantization formats.
+A collection of Python scripts for benchmarking quantized large language models (LLMs) on consumer-grade NVIDIA GPUs. Track prefill and decode throughput, time-to-first-token, and VRAM usage across different quantization formats.
+
+This repo drives inference through **llama-cpp-python** (GGUF via llama.cpp, CUDA-accelerated). It measures and characterizes kernels that llama.cpp provides — it does not implement CUDA kernels of its own.
+
+---
+
+## ⚠️ Results currently pending re-run
+
+The benchmark tables previously published here were **withdrawn in the 2026-08-03 methodology fix** and have not yet been regenerated.
+
+**What was wrong:** `benchmark.py` read a `timings` dict off the final streaming chunk, but llama-cpp-python does not populate `usage` or `timings` on streamed responses. The code therefore always fell through to a wall-clock fallback that divided *both* phases by the same total elapsed time. The published "Prompt (t/s)" column was actually `prompt_tokens / total_time` — a restatement of generation speed, not a measurement of prefill. Every row satisfied `prompt_tokens / prompt_tps == generated_tokens / gen_tps` exactly, which is the signature of the bug. The tell-tale symptom was prompt throughput reading *lower* than decode throughput; prefill should be roughly an order of magnitude faster.
+
+Two further issues were fixed alongside it:
+
+- **No warmup.** The first inference absorbed CUDA context creation and kernel autotuning. This is why the same configuration (llama2 Q4_K_M, `n_gpu_layers=99`) reported TTFT of 86.94 ms in the comparison table but 24.14 ms in the offload ladder — a 3.6× disagreement between two tables in this same README.
+- **VRAM was whole-board, not model.** `nvidia-smi` total usage was sampled *after* model load, so the figure included the Windows desktop compositor and any other GPU process.
+
+Numbers will reappear here once re-run on the reference hardware. Charts in `results/` are likewise stale until then.
 
 ---
 
@@ -25,7 +42,7 @@ A collection of Python scripts for benchmarking quantized large language models 
 
 ## 📊 What This Repo Tracks
 
-Benchmarks comparing the following quantization formats using **llama-cpp-python** (GGUF inference via llama.cpp, CUDA-accelerated):
+Benchmarks comparing the following quantization formats:
 
 | Format | Description |
 |--------|-------------|
@@ -33,12 +50,36 @@ Benchmarks comparing the following quantization formats using **llama-cpp-python
 | `Q5_K_M` | 5-bit K-quant (medium) — balance of speed and quality |
 | `Q8_0` | 8-bit quantization — near-FP16 quality, highest VRAM |
 
-Metrics captured per run:
-- Tokens / second (prompt processing & generation)
-- Time-to-first-token (TTFT, ms)
-- VRAM usage (MB)
-- Model load time (seconds)
-- Model file size (MB)
+Metrics captured per configuration, reported as **median ± sample stdev over N runs**:
+
+- **Prefill throughput** (t/s) — prompt processing, timed separately
+- **Decode throughput** (t/s) — token generation, timed separately
+- **Time-to-first-token** (TTFT, ms)
+- **VRAM attributable to the model** (MB), plus whole-board usage for reference
+- Model load time (s) and file size (MB)
+
+---
+
+## 🔬 Methodology
+
+Getting these numbers right is most of the work, so the approach is explicit:
+
+**Throughput comes from llama.cpp's own performance counters** (`llama_perf_context`), which report the two phases independently:
+
+| Counter | Phase |
+|---------|-------|
+| `t_p_eval_ms` / `n_p_eval` | prompt processing (prefill) |
+| `t_eval_ms` / `n_eval` | token generation (decode) |
+
+Wall-clock timing around a Python generator would also capture detokenization and loop overhead, and cannot separate prefill from decode at all. If the perf-counter API is unavailable, the harness falls back to a wall-clock decomposition around TTFT and **labels the row `wall_clock_estimate`** rather than silently reporting a number that looks like a measurement but isn't. Every result carries a `timing_source` column.
+
+**A warmup run precedes every measurement** and is discarded, so CUDA context setup and autotuning do not land in the reported figures.
+
+**Each configuration runs N times (default 3)** and reports the median, so one scheduling hiccup cannot move the headline number. Sample standard deviation is reported alongside and drawn as error bars.
+
+**KV cache and token state are cleared before every run.** Without this, llama-cpp-python's prompt-prefix reuse skips prefill on repeat runs of the same prompt and the prefill measurement collapses to nothing.
+
+**VRAM is a delta.** A baseline is sampled before model load and subtracted from peak, so the figure reflects the model rather than the whole board. Unmeasured values are recorded as `-1` and excluded from aggregates — never averaged in as zero.
 
 ---
 
@@ -100,6 +141,9 @@ python benchmark.py --model models/llama-2-7b-chat.Q8_0.gguf   --quant-type Q8_0
 
 # Example: benchmark a second family
 python benchmark.py --model models/mistral-7b-instruct-v0.1.Q4_K_M.gguf --quant-type Q4_K_M --model-family mistral --n-gpu-layers 99
+
+# Tighter error bars for a publishable run
+python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M --model-family llama2 --n-runs 10
 ```
 
 ### 4. Monitor GPU in a separate terminal
@@ -112,6 +156,7 @@ python monitor_gpu.py --interval 1
 
 ```bash
 python compare_quants.py
+python compare_quants.py --group-by model_family
 ```
 
 ---
@@ -120,86 +165,51 @@ python compare_quants.py
 
 | Script | Purpose | Key Args |
 |--------|---------|----------|
-| `benchmark.py` | Run inference benchmark | `--model`, `--quant-type`, `--model-family`, `--n-predict`, `--n-gpu-layers`, `--prompt` |
+| `benchmark.py` | Run inference benchmark | `--model`, `--quant-type`, `--model-family`, `--n-predict`, `--n-gpu-layers`, `--n-runs`, `--no-warmup`, `--prompt` |
 | `compare_quants.py` | Plot & compare results | `--group-by` (`quant_type` \| `model_family`); reads `results/benchmark_results.csv` |
-| `offload_ladder.py` | Sweep n_gpu_layers and plot VRAM vs speed | `--model`, `--quant-type`, `--steps` |
+| `offload_ladder.py` | Sweep n_gpu_layers and plot VRAM vs speed | `--model`, `--quant-type`, `--steps`, `--n-runs` |
 | `monitor_gpu.py` | Live GPU stats logger | `--interval`, `--output` |
 | `download_model.py` | Download GGUF models | `--model`, `--filename`, `--list` |
+| `bench_core.py` | Shared measurement logic (imported, not run directly) | — |
+| `results_schema.py` | CSV schema + migration (imported, not run directly) | — |
+
+`benchmark.py` and `offload_ladder.py` both delegate measurement to `bench_core.benchmark_model`, so the two entry points cannot drift apart in methodology. `results_schema.py` deliberately avoids importing `llama_cpp`, so `compare_quants.py` runs on any machine — you do not need a CUDA build just to plot results.
 
 ---
 
-## 🆕 New Features
-
-### ⏱️ TTFT — Time-to-First-Token
-
-`benchmark.py` now captures **time-to-first-token (TTFT)** in milliseconds alongside throughput metrics. TTFT is measured as the wall-clock time from the start of inference until the first generated chunk arrives, using llama-cpp-python's streaming API.
-
-The value is included in the CSV output (`ttft_ms` column) and printed in the benchmark summary:
-
-```
-  TTFT (ms)        : 42.17
-```
-
-### 📉 GPU Offload Ladder
+## 📉 GPU Offload Ladder
 
 `offload_ladder.py` systematically varies `--n-gpu-layers` across a configurable set of steps, benchmarks the model at each level, and produces:
 
 - A summary table printed to stdout
 - `results/offload_ladder.csv` with per-step metrics
-- `results/offload_ladder.png` — dual-axis line plot (gen t/s vs. VRAM MB)
+- `results/offload_ladder.png` — dual-axis plot (decode t/s with error bars vs. model VRAM)
 
 ```bash
 python offload_ladder.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M
 python offload_ladder.py --model models/llama-2-7b-chat.Q4_K_M.gguf --quant-type Q4_K_M --steps 0,16,32,99
 ```
 
-### 🏷️ Multi-Model Family Support
-
-`benchmark.py` now accepts a `--model-family` flag to tag results with the model family (e.g. `llama2`, `mistral`, `phi3`, `gemma`):
-
-```bash
-python benchmark.py --model models/mistral-7b-instruct-v0.1.Q4_K_M.gguf --quant-type Q4_K_M --model-family mistral
-python benchmark.py --model models/llama-2-7b-chat.Q4_K_M.gguf     --quant-type Q4_K_M --model-family llama2
-```
-
-`compare_quants.py` gains a `--group-by` argument. When set to `model_family`, it generates a grouped bar chart saved to `results/comparison_by_family.png` and prints a markdown table grouped by model family:
-
-```bash
-python compare_quants.py --group-by model_family
-```
-
-> **Backward compatibility:** legacy benchmark CSV files are migrated to the latest schema when new benchmark rows are appended, and comparison loading remains resilient when older rows are present.
-
 ---
 
+## 🗃️ Results Schema
 
+Results land in `results/benchmark_results.csv`:
 
-**Hardware:** NVIDIA RTX 5070 Laptop GPU (8 GB VRAM) · CUDA 13.2 · Driver 595.97  
-**Backend:** llama-cpp-python 0.3.20, built from source · Full GPU offload (`--n-gpu-layers 99`)  
-**Prompt:** 16 tokens · **Generated:** 65 tokens
+| Column | Meaning |
+|--------|---------|
+| `model_name`, `model_family`, `quant_type` | Identity of the configuration |
+| `n_gpu_layers`, `n_runs` | Configuration and sample size |
+| `prompt_tokens`, `generated_tokens` | Token counts as reported by llama.cpp |
+| `prefill_tps`, `prefill_tps_std` | Prompt processing throughput |
+| `decode_tps`, `decode_tps_std` | Generation throughput |
+| `ttft_ms`, `ttft_ms_std` | Time to first token |
+| `vram_delta_mb` | VRAM attributable to the model |
+| `vram_total_mb` | Whole-board VRAM at peak |
+| `load_time_s`, `model_size_mb` | Load cost and file size |
+| `timing_source` | `perf_counters`, `wall_clock_estimate`, or `legacy_invalid` |
 
-![Quantization Comparison](results/comparison.png)
-
-| Model Family | Quant | Gen (t/s) | Prompt (t/s) | TTFT (ms) | VRAM (MB) | Size (MB) |
-|--------------|-------|-----------|--------------|-----------|-----------|-----------|
-| llama2 | Q4_K_M | 48.27 | 11.88 | 86.94 | 4308 | 3892 |
-| llama2 | Q5_K_M | 43.69 | 10.75 | 77.88 | 4962 | 4562 |
-| llama2 | Q8_0 | 34.80 | 8.57 | 80.62 | 7182 | 6829 |
-| mistral | Q4_K_M | 46.83 | 11.53 | 75.57 | 4406 | 4166 |
-| mistral | Q5_K_M | 40.79 | 10.04 | 73.81 | 5118 | 4894 |
-| mistral | Q8_0 | 31.32 | 7.71 | 75.85 | 7516 | 7339 |
-
-![Comparison by Family](results/comparison_by_family.png)
-
-| Offload | Gen (t/s) | Prompt (t/s) | TTFT (ms) | VRAM (MB) |
-|---------|-----------|--------------|-----------|-----------|
-| `n_gpu_layers=0` | 9.78 | 2.41 | 1301.80 | 288 |
-| `n_gpu_layers=20` | 19.70 | 4.85 | 470.32 | 2708 |
-| `n_gpu_layers=99` | 52.68 | 12.97 | 24.14 | 4308 |
-
-![GPU Offload Ladder](results/offload_ladder.png)
-
-> On this 8 GB GPU, full offload of 7B Q4/Q5 models leaves usable headroom, while Q8 runs close to the limit. TTFT improves dramatically as more layers move from CPU to GPU.
+**Schema migration.** CSVs from earlier revisions are migrated automatically when new rows are appended, and the original is preserved as `benchmark_results.legacy.<timestamp>.csv`. Rows written before the methodology fix are marked `legacy_invalid`; their throughput columns are set to `-1` rather than carried forward, because the underlying numbers are not recoverable after the fact. `compare_quants.py` excludes those rows from charts and tables and prints a warning naming how many it dropped.
 
 ---
 
@@ -209,7 +219,9 @@ python compare_quants.py --group-by model_family
 llm-qlab/
 ├── README.md
 ├── requirements.txt
-├── benchmark.py          # Main benchmark runner
+├── benchmark.py          # Main benchmark runner (CLI)
+├── bench_core.py         # Shared measurement logic
+├── results_schema.py     # CSV schema + migration (no llama_cpp dependency)
 ├── compare_quants.py     # Comparison plots & table
 ├── offload_ladder.py     # GPU offload ladder sweep
 ├── monitor_gpu.py        # Live GPU monitor
@@ -227,7 +239,7 @@ llm-qlab/
 
 ## 🤝 Contributing
 
-PRs and issues welcome! If you have results from other GPUs or models, feel free to open a PR with your data.
+PRs and issues welcome! If you have results from other GPUs or models, feel free to open a PR with your data — please include the `timing_source` column so methodology is auditable.
 
 ---
 
