@@ -8,8 +8,19 @@ Usage:
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from huggingface_hub import hf_hub_download
+
+# On Windows, stdout falls back to the locale codec (cp1252) whenever it is
+# not an interactive console — redirected to a file, piped, or run from CI.
+# The status emoji below are then unencodable and the download dies before it
+# starts. Force UTF-8 and degrade unprintable characters instead of raising.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # pragma: no cover - non-reconfigurable stream
+        pass
 
 # Popular GGUF models
 POPULAR_MODELS = {
