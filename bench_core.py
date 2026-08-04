@@ -279,6 +279,55 @@ def get_vram_free_mb() -> float:
 # the 2026-08-04 sweep, which ranged 397-737 MB with the KV cache subtracted.
 CUDA_SESSION_OVERHEAD_MB = 420.0
 
+# Bytes per weight for the GGUF block formats used here. Each is the block's
+# encoded size divided by the weights it holds — Q8_0 packs 32 weights into 34
+# bytes, Q4_K packs 256 into 144, and so on.
+#
+# These are used only for the token embedding table, which llama.cpp leaves on
+# the host even at full offload. Checked against measured host residency across
+# all three families: Q4_K_M 70 MB, Q5_K_M 86 MB, Q8_0 133 MB for a 32000x4096
+# table, each matching its format's block size exactly.
+BYTES_PER_WEIGHT = {
+    "Q2_K": 84 / 256, "Q3_K": 110 / 256,
+    "Q4_0": 18 / 32, "Q4_1": 20 / 32, "Q4_K": 144 / 256,
+    "Q5_0": 22 / 32, "Q5_1": 24 / 32, "Q5_K": 176 / 256,
+    "Q6_K": 210 / 256, "Q8_0": 34 / 32,
+    "F16": 2.0, "BF16": 2.0, "F32": 4.0,
+}
+
+
+def bytes_per_weight(quant_type: str) -> float:
+    """Bytes per weight for a GGUF quant label, or UNKNOWN if unrecognized.
+
+    Labels carry a size suffix the block format does not — Q4_K_M and Q4_K_S
+    are both Q4_K blocks — so the suffix is trimmed before lookup.
+    """
+    if not quant_type:
+        return UNKNOWN
+    key = quant_type.strip().upper()
+    for candidate in (key, key.rsplit("_", 1)[0]):
+        if candidate in BYTES_PER_WEIGHT:
+            return BYTES_PER_WEIGHT[candidate]
+    return UNKNOWN
+
+
+def estimate_host_embedding_mb(geometry: dict[str, int], quant_type: str) -> float:
+    """Size of the token embedding table, which stays on the host.
+
+    llama.cpp uploads every transformer layer at full offload but leaves
+    token_embd on the CPU, so GGUF file size overstates VRAM demand by exactly
+    this much. It is not a rounding error: Qwen2.5-7B's 152k-token vocabulary
+    makes a 552 MB table, against 133 MB for Llama-2's 32k — a 419 MB
+    difference between two files within 900 MB of each other, and enough to
+    wrongly refuse a model that fits.
+    """
+    vocab = geometry.get("vocab_size", -1)
+    embedding = geometry.get("embedding", -1)
+    per_weight = bytes_per_weight(quant_type)
+    if min(vocab, embedding) <= 0 or per_weight <= 0:
+        return UNKNOWN
+    return vocab * embedding * per_weight / (1024 * 1024)
+
 
 def _meta_int(meta: dict[str, Any], suffix: str) -> int:
     """Look up a GGUF metadata key by suffix, ignoring the architecture prefix.
@@ -305,7 +354,12 @@ def read_model_geometry(model_path: str) -> dict[str, int]:
     """
     try:
         with contextlib.redirect_stderr(io.StringIO()):
-            meta = Llama(model_path=model_path, vocab_only=True, verbose=False).metadata
+            probe = Llama(model_path=model_path, vocab_only=True, verbose=False)
+            meta = probe.metadata
+            try:
+                vocab_size = int(probe.n_vocab())
+            except Exception:
+                vocab_size = -1
     except Exception:
         return {}
 
@@ -321,7 +375,8 @@ def read_model_geometry(model_path: str) -> dict[str, int]:
         head_dim = embedding // heads
 
     return {"layers": layers, "heads": heads, "kv_heads": kv_heads,
-            "head_dim": head_dim, "embedding": embedding}
+            "head_dim": head_dim, "embedding": embedding,
+            "vocab_size": vocab_size}
 
 
 def estimate_kv_cache_mb(geometry: dict[str, int], n_ctx: int) -> float:
@@ -934,6 +989,7 @@ def benchmark_model(
     n_runs: int = 3,
     warmup: bool = True,
     verbose: bool = True,
+    quant_type: str = "",
 ) -> dict[str, Any]:
     """Load a model, warm it up, run *n_runs* measured passes, and aggregate.
 
@@ -958,16 +1014,23 @@ def benchmark_model(
     # Q8_0 models sitting at 93-98% of an 8 GB card.
     model_size_mb = round(Path(model_path).stat().st_size / (1024 * 1024), 1)
     if n_gpu_layers != 0:
-        # Geometry comes from the GGUF header, so the KV cache is computed from
-        # attention shape rather than assumed as a share of file size.
+        # Geometry comes from the GGUF header, so both the KV cache and the
+        # host-resident embedding table are computed from the model's actual
+        # shape rather than assumed as a share of file size.
         geometry = read_model_geometry(model_path)
         kv_mb = estimate_kv_cache_mb(geometry, DEFAULT_N_CTX)
+        host_mb = estimate_host_embedding_mb(geometry, quant_type)
+        device_mb = model_size_mb - host_mb if host_mb > 0 else UNKNOWN
         if verbose and kv_mb > 0:
             print(f"Geometry: {geometry['layers']} layers, "
                   f"{geometry['kv_heads']}/{geometry['heads']} KV heads, "
                   f"head_dim {geometry['head_dim']} — "
                   f"KV cache {kv_mb:.0f} MB at n_ctx={DEFAULT_N_CTX}")
-        fits, headroom_note = check_vram_headroom(model_size_mb, kv_cache_mb=kv_mb)
+        if verbose and host_mb > 0:
+            print(f"          {geometry['vocab_size']} vocab — embedding table "
+                  f"{host_mb:.0f} MB stays on host, {device_mb:.0f} MB to device")
+        fits, headroom_note = check_vram_headroom(
+            model_size_mb, device_weight_mb=device_mb, kv_cache_mb=kv_mb)
     else:
         fits, headroom_note = True, "cpu only"
     if not fits:

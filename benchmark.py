@@ -105,6 +105,9 @@ def main() -> None:
         n_predict=args.n_predict,
         n_runs=args.n_runs,
         warmup=not args.no_warmup,
+        # Needed to size the host-resident embedding table, which decides
+        # whether the model fits.
+        quant_type=args.quant_type,
     )
     result["model_family"] = args.model_family
     result["quant_type"] = args.quant_type

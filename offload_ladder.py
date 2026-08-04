@@ -271,6 +271,7 @@ def main() -> None:
             prompt=args.prompt,
             n_predict=args.n_predict,
             n_runs=args.n_runs,
+            quant_type=args.quant_type,
         )
         row["model_family"] = args.model_family
         row["quant_type"] = args.quant_type
