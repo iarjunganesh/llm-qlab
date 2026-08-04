@@ -19,7 +19,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from bench_core import DEFAULT_PROMPT, benchmark_model
+from llm_qlab.bench_core import DEFAULT_PROMPT, benchmark_model
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +45,9 @@ LADDER_FIELDS = [
     "vram_total_mb",
     "vram_residency",
     "offload_state",
+    "pstate",
+    "mem_clock_mhz",
+    "throttle_reasons",
     "load_time_s",
     "timing_source",
 ]
@@ -115,8 +118,19 @@ def print_ladder_summary(model_name: str, quant_type: str, rows: list[dict]) -> 
         )
     print(sep)
 
-    if any(r["timing_source"] != "perf_counters" for r in rows):
-        print("[warn] One or more steps fell back to wall-clock estimates.")
+    # Name the actual reason. An earlier revision reported every non-perf_counters
+    # row as "fell back to wall-clock estimates", which was untrue for rows that
+    # were timed correctly and flagged for clock state or refused for VRAM —
+    # asserting a diagnosis that was not the one made.
+    by_source: dict[str, int] = {}
+    for r in rows:
+        source = r["timing_source"]
+        if source != "perf_counters":
+            by_source[source] = by_source.get(source, 0) + 1
+    if by_source:
+        detail = ", ".join(f"{count} {source}" for source, count in sorted(by_source.items()))
+        print(f"[warn] {sum(by_source.values())} of {len(rows)} steps are not "
+              f"publishable: {detail}.")
 
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,63 @@ def test_the_real_mistral_case_keeps_only_the_clean_run():
     assert out.iloc[0]["decode_tps"] == 49.07
 
 
+class TestFlaggedRunsCannotDeleteVerifiedOnes:
+    """The real llama-2 Q5_K_M case.
+
+    Measured clean at 65.31 t/s, re-measured hours later with a 2.4% clock
+    spread, and vanished from every chart: the good row was discarded as
+    superseded and the flagged row filtered out behind it, leaving the series
+    empty. An unstable measurement is an absence of evidence, not evidence the
+    earlier verified one was wrong.
+    """
+
+    def test_earlier_verified_row_wins_over_a_later_flagged_one(self):
+        df = pd.DataFrame([
+            row(decode=65.31, source="perf_counters"),
+            row(decode=65.40, source="unstable_clocks"),
+        ])
+        out = _keep_latest_per_config(df)
+        assert len(out) == 1
+        assert out.iloc[0]["decode_tps"] == 65.31
+        assert out.iloc[0]["timing_source"] == "perf_counters"
+
+    def test_the_series_does_not_disappear(self):
+        """The symptom that surfaced the bug: a hole in the chart."""
+        df = pd.DataFrame([
+            row(quant="Q4_K_M", decode=74.5, source="perf_counters"),
+            row(quant="Q5_K_M", decode=65.31, source="perf_counters"),
+            row(quant="Q5_K_M", decode=65.40, source="unstable_clocks"),
+        ])
+        out = _keep_latest_per_config(df)
+        publishable = out[out["timing_source"] == "perf_counters"]
+        assert set(publishable["quant_type"]) == {"Q4_K_M", "Q5_K_M"}
+
+    def test_a_newer_verified_row_still_wins(self):
+        """Recency must still beat staleness among publishable rows."""
+        df = pd.DataFrame([
+            row(decode=51.17, source="perf_counters"),
+            row(decode=65.31, source="perf_counters"),
+        ])
+        assert _keep_latest_per_config(df).iloc[0]["decode_tps"] == 65.31
+
+    def test_all_flagged_keeps_the_newest_so_the_flag_stays_visible(self):
+        df = pd.DataFrame([
+            row(decode=54.45, source="unstable_clocks"),
+            row(decode=65.40, source="unstable_clocks"),
+        ])
+        out = _keep_latest_per_config(df)
+        assert len(out) == 1
+        assert out.iloc[0]["decode_tps"] == 65.40
+        assert out.iloc[0]["timing_source"] == "unstable_clocks"
+
+    def test_a_refused_row_does_not_shadow_a_measured_one(self):
+        df = pd.DataFrame([
+            row(decode=45.71, source="perf_counters"),
+            row(decode=-1.0, source="skipped_insufficient_vram"),
+        ])
+        assert _keep_latest_per_config(df).iloc[0]["decode_tps"] == 45.71
+
+
 def test_distinct_configurations_are_all_kept():
     df = pd.DataFrame([
         row(name="a", quant="Q4_K_M"),

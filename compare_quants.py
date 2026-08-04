@@ -23,14 +23,21 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from results_schema import (
-    CSV_FIELDS, CSV_PATH, LEGACY_MARKER, UNSTABLE_MARKER, normalize_row,
+from llm_qlab.results_schema import (
+    CSV_FIELDS, CSV_PATH, LEGACY_MARKER, SKIPPED_MARKER, UNSTABLE_MARKER,
+    normalize_row,
 )
 
-# Neither marker denotes a publishable measurement, for different reasons:
+# None of these denotes a publishable measurement, for three different reasons:
 # legacy rows were timed by a broken path, unstable rows were timed correctly
-# but without evidence the GPU held a consistent clock state.
-EXCLUDED_SOURCES = (LEGACY_MARKER, UNSTABLE_MARKER)
+# but without evidence the GPU held a consistent clock state, and skipped rows
+# were never measured at all because the model did not fit in VRAM.
+#
+# Skipped rows matter here beyond charting. They carry decode_tps = -1, which
+# aggregates already drop, but they are still *rows* — so without this a refusal
+# recorded after a successful measurement would win the recency contest in
+# _keep_latest_per_config and shadow the real number behind it.
+EXCLUDED_SOURCES = (LEGACY_MARKER, UNSTABLE_MARKER, SKIPPED_MARKER)
 
 RESULTS_DIR = Path("results")
 OUTPUT_PNG = RESULTS_DIR / "comparison.png"
@@ -48,7 +55,7 @@ MUTED = "#5c5c5a"
 QUANT_ORDER = ["Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M",
                "Q5_0", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
 
-# Schema handling is shared with benchmark.py — see results_schema.py.
+# Schema handling is shared with benchmark.py — see llm_qlab/results_schema.py.
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +75,7 @@ CONFIG_KEY = ["model_name", "quant_type", "n_gpu_layers"]
 
 
 def _keep_latest_per_config(df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse repeated measurements of one configuration to the newest.
+    """Collapse repeated measurements of one configuration to the newest usable one.
 
     benchmark.py appends rather than replaces, so re-running a configuration —
     which is exactly what the harness tells you to do when a row comes back
@@ -76,15 +83,44 @@ def _keep_latest_per_config(df: pd.DataFrame) -> pd.DataFrame:
     which one a lookup returns depends on row order rather than recency. That
     would let a superseded number be published after it had been re-measured.
 
+    "Newest" alone is not enough, though. Taking the newest row unconditionally
+    and *then* dropping unpublishable rows lets a flagged run delete a verified
+    one: llama-2 Q5_K_M was measured clean at 65.31 t/s, re-measured hours later
+    with a 2.4% clock spread, and vanished from every chart — the good row
+    discarded as superseded, the flagged row filtered out behind it.
+
+    So the choice is the newest *publishable* row, falling back to the newest
+    overall only when every row for that configuration is flagged, which keeps
+    the flag visible rather than silently emptying the series. An unstable
+    measurement is an absence of evidence, not evidence that an earlier verified
+    measurement was wrong.
+
     Rows are in append order, so the last occurrence is the newest.
     """
     if not set(CONFIG_KEY).issubset(df.columns):
         return df
-    superseded = len(df) - len(df.drop_duplicates(subset=CONFIG_KEY, keep="last"))
+
+    df = df.reset_index(drop=True)
+    usable = ~df["timing_source"].isin(EXCLUDED_SOURCES)
+    keep, fell_back = [], 0
+    for _, group in df.groupby(CONFIG_KEY, sort=False):
+        publishable = group.index[usable.loc[group.index]]
+        if len(publishable):
+            chosen = publishable[-1]
+            if chosen != group.index[-1]:
+                fell_back += 1
+        else:
+            chosen = group.index[-1]
+        keep.append(chosen)
+
+    superseded = len(df) - len(keep)
     if superseded:
         print(f"[info] {superseded} superseded row(s) ignored — a newer "
               "measurement exists for the same configuration.")
-    return df.drop_duplicates(subset=CONFIG_KEY, keep="last").reset_index(drop=True)
+    if fell_back:
+        print(f"[info] {fell_back} configuration(s) fall back to an earlier "
+              "verified measurement because the most recent one is flagged.")
+    return df.loc[sorted(keep)].reset_index(drop=True)
 
 
 def load_results() -> pd.DataFrame:
@@ -188,6 +224,43 @@ def _caption_for_empty(fig, empty: list[str]) -> None:
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
+
+# Blue ramp steps 250..650, the band legal for an *ordinal* encoding on this
+# light surface. Quantization format is ordinal, not nominal: Q4_K_M, Q5_K_M and
+# Q8_0 are size tiers, and reordering them would change the meaning. A one-hue
+# ramp puts that order in the colour; categorical hues would spend the identity
+# channel and throw the ordering away.
+#
+# The band matters. Lighter steps exist (200 = #9ec5f4) and are legal for a
+# continuous sequential scale, where the lightest value means "near zero" and may
+# recede into the surface. An ordinal mark must stay visible: step 200 measures
+# 1.74:1 against this surface, under the 2:1 floor. An earlier revision indexed
+# a hardcoded list from the dark end, which happened to avoid step 200 at three
+# quant formats and would have selected it at four.
+ORDINAL_BLUE = [
+    "#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6",
+    "#256abf", "#1c5cab", "#184f95", "#104281",
+]
+
+
+# Above this the band cannot supply steps that stay 0.06 apart in lightness, so
+# adjacent formats stop being separable. This is a property of the ramp, not a
+# thing to tune away: at six or more formats the answer is small multiples, not
+# finer steps nobody can tell apart.
+MAX_ORDINAL_STEPS = 5
+
+
+def _ordinal_ramp(n: int) -> list[str]:
+    """Evenly spaced steps across the ordinal band, light to dark."""
+    if n <= 1:
+        return [ORDINAL_BLUE[len(ORDINAL_BLUE) // 2]]
+    if n > MAX_ORDINAL_STEPS:
+        print(f"[warn] {n} quantization formats exceeds the {MAX_ORDINAL_STEPS} "
+              "the ordinal ramp can keep visually distinct — adjacent formats "
+              "will be hard to tell apart. Consider faceting.")
+    last = len(ORDINAL_BLUE) - 1
+    return [ORDINAL_BLUE[round(i * last / (n - 1))] for i in range(n)]
+
 
 def _family_colors(families: list[str]) -> dict[str, str]:
     """Map each family to a fixed categorical slot.
@@ -300,8 +373,7 @@ def plot_comparison_by_family(df: pd.DataFrame) -> None:
     fig.suptitle("Decode t/s by Model Family — llm-qlab", fontsize=14,
                  fontweight="bold", color=INK)
 
-    # Quant is ordinal here, so step one hue light->dark rather than cycling hues.
-    colors = ["#9ec5f4", "#5598e7", "#2a78d6", "#1c5cab", "#104281"][-len(quants):]
+    colors = _ordinal_ramp(len(quants))
     for i, quant in enumerate(quants):
         subset = agg[agg["quant_type"] == quant]
         values, errors = [], []

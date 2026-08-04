@@ -11,8 +11,8 @@ reported convergence.
 
 import pytest
 
-import bench_core
-from bench_core import (
+from llm_qlab import bench_core
+from llm_qlab.bench_core import (
     MIN_MEM_CLOCK_FRACTION,
     UNKNOWN,
     ClockSampler,
@@ -179,6 +179,79 @@ class TestClockSampleSummaries:
 ])
 def test_gate_matrix(pstate, mem, expected):
     assert clocks_are_boosted(state(pstate=pstate, mem=mem)) is expected
+
+
+class TestUngatedRowsAreJudgedOnThroughput:
+    """Where the floor does not apply, the clock is a covariate, not a control.
+
+    On CPU-only rows the recorded clock is idle noise; on partial offload it
+    drifts with how often the GPU stalls on PCIe. Judging those rows on clock
+    agreement failed five of seven ladder steps whose throughput was tight to
+    about 1% — repeatable measurements rejected on a criterion that did not
+    describe them. Each case below is a row from that ladder.
+    """
+
+    @pytest.mark.parametrize("name,clocks,decode", [
+        # llama2 L=0, CPU-only: clock wandered 3.8%, throughput within 2.3%.
+        ("llama2 L=0", [9001, 9406, 9700], [11.61, 11.83, 11.88]),
+        # mistral L=16 and L=24, partial offload, throughput within ~1%.
+        ("mistral L=16", [9001, 9068, 9200], [18.60, 18.82, 18.95]),
+        ("mistral L=24", [9001, 9088, 9300], [25.50, 25.70, 25.88]),
+        # mistral L=32, near-resident, clock spread wide, throughput tight.
+        ("mistral L=32", [11101, 11851, 12101], [60.60, 61.23, 61.80]),
+    ])
+    def test_tight_throughput_passes_despite_a_wandering_clock(self, name, clocks, decode):
+        coherent, _ = bench_core._clocks_are_coherent(clocks, decode, gated=False)
+        assert coherent is True, f"{name} should pass ungated"
+
+    def test_genuinely_unstable_throughput_still_fails(self):
+        """llama2 L=32: 46.33 / 46.80 / 60.29 — a real 23% spread."""
+        coherent, _ = bench_core._clocks_are_coherent(
+            [9001, 9651, 11500], [46.33, 46.80, 60.29], gated=False)
+        assert coherent is False
+
+    def test_the_same_rows_would_have_failed_under_the_gated_rule(self):
+        """Shows the rule change is what fixes them, not looser numbers."""
+        coherent, _ = bench_core._clocks_are_coherent(
+            [9001, 9406, 9700], [11.61, 11.83, 11.88], gated=True)
+        assert coherent is False
+
+    def test_gated_rows_are_unaffected_by_the_ungated_path(self):
+        coherent, _ = bench_core._clocks_are_coherent(
+            [12101, 12101, 12101], [74.4, 74.5, 74.3], gated=True)
+        assert coherent is True
+
+    def test_ungated_without_throughput_data_does_not_fail_closed(self):
+        assert bench_core._clocks_are_coherent([9001, 9700], None, gated=False)[0] is True
+
+
+class TestCpuOnlyIsUngated:
+    """At n_gpu_layers=0 the GPU is idle by design, not by fault.
+
+    under_load() filters idle P-states out, so a CPU-only run leaves the
+    sampler with nothing to judge and the gate would reject every attempt --
+    making the offload ladder's CPU endpoint permanently unmeasurable.
+    """
+
+    def test_idle_samples_leave_nothing_under_load(self):
+        sampler = ClockSampler()
+        sampler.samples = [state(pstate="P5", mem=810), state(pstate="P8", mem=405)]
+        assert sampler.under_load() == []
+        assert sampler.min_mem_mhz() == UNKNOWN
+
+    def test_that_emptiness_is_what_would_have_rejected_the_run(self):
+        """The gate's own precondition, shown failing on a CPU-only sample."""
+        sampler = ClockSampler()
+        sampler.samples = [state(pstate="P5", mem=810)]
+        loaded, floor = sampler.under_load(), sampler.min_mem_mhz()
+        would_reject = (not loaded) or floor < 0
+        assert would_reject is True
+
+    def test_a_gpu_run_is_not_accidentally_ungated(self):
+        """The bypass must key on configuration, never on absent telemetry."""
+        sampler = ClockSampler()
+        sampler.samples = [state(pstate="P0", mem=12101)]
+        assert sampler.under_load() != []
 
 
 class TestObservedMaxReference:

@@ -1,5 +1,5 @@
 """
-bench_core.py — Shared measurement logic for llm-qlab benchmarks.
+llm_qlab/bench_core.py — Shared measurement logic for llm-qlab benchmarks.
 
 Both benchmark.py and offload_ladder.py import from here so that timing
 methodology stays identical between the two entry points.
@@ -101,6 +101,19 @@ CLOCK_COHERENCE_TOLERANCE = 0.02
 # 1.23x artifact this machinery exists to exclude, so it cannot readmit it.
 THROUGHPUT_COHERENCE_TOLERANCE = 0.01
 
+# Repeatability required of rows the clock floor does not gate. Looser than the
+# override above because it is the primary test there rather than an escape
+# hatch, and because CPU-only and PCIe-bound work are inherently noisier than
+# a fully resident model. Measured ladder steps that should pass sit near 1-2%;
+# llama-2 at 32/33 layers, which genuinely oscillates, spans 23%.
+UNGATED_THROUGHPUT_TOLERANCE = 0.05
+
+# Attempts allowed per requested clean run was 4x; mistral at full offload
+# exhausted 12 attempts and produced no measurement at all while llama-2 and
+# qwen2.5 succeeded on the same step, so the budget rather than the hardware was
+# the binding constraint.
+CLOCK_ATTEMPT_BUDGET_GATED = 8
+
 # nvidia-smi clocks_event_reasons bits.
 THROTTLE_GPU_IDLE = 0x1
 THROTTLE_APP_CLOCKS = 0x2
@@ -123,10 +136,10 @@ THROTTLE_DISQUALIFYING = (
     | THROTTLE_HW_THERMAL | THROTTLE_HW_POWER_BRAKE
 )
 
-# Attempts allowed per requested clean run. The card migrates P-states on its
-# own, so some proportion of runs will always be discarded; this bounds how
-# long a configuration may spend trying rather than failing silently.
-CLOCK_ATTEMPT_BUDGET = 4
+# Superseded by CLOCK_ATTEMPT_BUDGET_GATED above, which distinguishes rows the
+# clock can reject from rows it cannot. Retained so an external caller pinning
+# the old name keeps working.
+CLOCK_ATTEMPT_BUDGET = CLOCK_ATTEMPT_BUDGET_GATED
 
 # Anything above this before the model loads means another process is on the GPU.
 IDLE_UTILIZATION_PCT = 10.0
@@ -251,6 +264,24 @@ def wait_for_vram_release(target_mb: float, *, tolerance_mb: float = 400.0,
             return current
         time.sleep(0.5)
     return current
+
+
+def wait_for_gpu_idle(*, threshold_pct: float = IDLE_UTILIZATION_PCT,
+                      timeout_s: float = 20.0) -> float:
+    """Block until GPU utilization drops to idle, and return what it reached.
+
+    Returns the last reading either way, so the caller can still warn when the
+    device never went quiet — a timeout here means something else is genuinely
+    competing, which is worth reporting rather than silently absorbing.
+    """
+    deadline = time.time() + timeout_s
+    utilization = get_gpu_utilization()
+    while time.time() < deadline:
+        utilization = get_gpu_utilization()
+        if utilization < 0 or utilization <= threshold_pct:
+            return utilization
+        time.sleep(0.5)
+    return utilization
 
 
 def _sample_peak(current_peak: float) -> float:
@@ -586,7 +617,8 @@ def _relative_spread(values: list[float]) -> float:
 
 
 def _clocks_are_coherent(mean_clocks: list[float],
-                         decode_tps: list[float] | None = None) -> tuple[bool, float]:
+                         decode_tps: list[float] | None = None,
+                         *, gated: bool = True) -> tuple[bool, float]:
     """Were the accepted runs comparable enough to aggregate?
 
     Returns (coherent, clock_spread).
@@ -605,6 +637,20 @@ def _clocks_are_coherent(mean_clocks: list[float],
     set that ran at a low clock throughout.
     """
     clock_spread = _relative_spread(mean_clocks)
+
+    # Where the floor does not apply, the clock is a recorded covariate rather
+    # than a controlled variable: on CPU-only rows it is idle noise, and on
+    # partial offload it drifts with how often the GPU stalls on PCIe. Judging
+    # those rows on clock agreement failed five of seven ladder steps whose
+    # throughput was tight to ~1% — measurements that were repeatable being
+    # rejected on a criterion that did not describe them. Repeatability of the
+    # number itself is the right test there.
+    if not gated:
+        if not decode_tps:
+            return True, clock_spread
+        throughput_spread = _relative_spread(decode_tps)
+        return throughput_spread <= UNGATED_THROUGHPUT_TOLERANCE, clock_spread
+
     if clock_spread <= CLOCK_COHERENCE_TOLERANCE:
         return True, clock_spread
     if decode_tps and _relative_spread(decode_tps) <= THROUGHPUT_COHERENCE_TOLERANCE:
@@ -1003,9 +1049,16 @@ def benchmark_model(
     # browser and chat client on the desktop; a busy neighbour has been seen to
     # move decode by 30% between otherwise identical invocations. The harness
     # cannot prevent that, so it at least refuses to report it as a clean number.
-    baseline_util = get_gpu_utilization()
+    # Wait for the board to go quiet first. Inside a sweep the usual cause of a
+    # busy GPU is not a neighbour process but the previous configuration still
+    # tearing down: wait_for_vram_release returns once the memory is handed
+    # back, which happens before the device actually goes idle. Qwen2.5 at full
+    # offload was measured at 40% baseline utilization straight after the step
+    # before it and came back flagged, so the gap was worth closing rather than
+    # only warning about.
+    baseline_util = wait_for_gpu_idle()
     if verbose and baseline_util > IDLE_UTILIZATION_PCT:
-        print(f"[warn] GPU already {baseline_util:.0f}% busy before load — another "
+        print(f"[warn] GPU still {baseline_util:.0f}% busy after waiting — another "
               "process is competing; results will read low and vary")
 
     # Refuse configurations that cannot be held in VRAM. Without this the model
@@ -1094,6 +1147,33 @@ def benchmark_model(
     # A streak of WARMUP_STREAK agreeing runs is required, not a single pair,
     # and every run in the streak must have been taken at a boosted memory
     # clock. Either condition alone was demonstrably insufficient.
+    # Whether the memory-clock *floor* applies depends on who governs decode.
+    #
+    # The floor exists to exclude one specific artifact: the same workload
+    # measured at two different clocks, which produced a 1.23x bimodal split.
+    # That reasoning holds only when the GPU is the bottleneck. When weights are
+    # split across the PCIe bus the GPU is idle for much of each token, so the
+    # driver downclocks to P4 — and that low clock is not contamination, it is
+    # the regime being measured. Gating on it rejects every run: in the
+    # 2026-08-04 ladder every partial step on all three families rejected 12 of
+    # 12 attempts at exactly 9001 MHz, a consistency that is itself the proof
+    # the clock was intrinsic rather than incidental.
+    #
+    # So: floor the clock only when every layer is resident. Below that, still
+    # record the clock and still require the accepted runs to agree with each
+    # other — a partial-offload row may sit at a low clock, but its runs must
+    # sit at the *same* low clock for their spread to mean anything.
+    fully_resident = bool(
+        placement and placement["layers_total"] > 0
+        and placement["layers_offloaded"] >= placement["layers_total"]
+    )
+    clock_gated = n_gpu_layers != 0 and fully_resident
+    if verbose and not clock_gated:
+        why = ("CPU-only configuration" if n_gpu_layers == 0
+               else "partial offload — weights split across PCIe")
+        print(f"{why}: the GPU does not govern decode here, so the memory-clock "
+              "floor is not applied (clock still recorded, runs must still agree)")
+
     warmup_converged = True
     if warmup:
         if verbose:
@@ -1108,7 +1188,8 @@ def benchmark_model(
             ceiling = reference_max_mem_mhz()
             # Judged on the clock held *during* the run. Reading it afterwards
             # samples the idle state, which the card reaches almost immediately.
-            boosted = floor > 0 and ceiling > 0 and floor >= ceiling * MIN_MEM_CLOCK_FRACTION
+            boosted = (not clock_gated) or (
+                floor > 0 and ceiling > 0 and floor >= ceiling * MIN_MEM_CLOCK_FRACTION)
             agreed = (previous > 0 and observed > 0
                       and abs(observed - previous) / previous < WARMUP_TOLERANCE)
             streak = streak + 1 if (agreed and boosted) else 0
@@ -1120,9 +1201,14 @@ def benchmark_model(
             if streak >= WARMUP_STREAK:
                 warmup_converged = True
                 if verbose:
+                    # Must not claim a clock condition on a row where the gate
+                    # was disabled — asserting an unperformed check is the
+                    # defect this harness exists to avoid.
+                    basis = ("at full memory clock" if clock_gated
+                             else "memory-clock floor not applied")
                     print(f"Warmed up after {attempt + 1} runs "
                           f"({WARMUP_STREAK} consecutive within "
-                          f"{WARMUP_TOLERANCE:.0%} at full memory clock)")
+                          f"{WARMUP_TOLERANCE:.0%}, {basis})")
                 break
         if not warmup_converged and verbose:
             print(f"[warn] decode rate still moving after {MAX_WARMUP_RUNS} warmup "
@@ -1146,7 +1232,9 @@ def benchmark_model(
     rejected: list[str] = []
     clock_samples: list[dict[str, Any]] = []
     run_mean_clocks: list[float] = []
-    max_attempts = max(n_runs * CLOCK_ATTEMPT_BUDGET, n_runs)
+    # Ungated rows are never rejected on clock, so they need no retry headroom.
+    budget = CLOCK_ATTEMPT_BUDGET_GATED if clock_gated else 1
+    max_attempts = max(n_runs * budget, n_runs)
     attempt = 0
     while len(runs) < n_runs and attempt < max_attempts:
         attempt += 1
@@ -1161,6 +1249,16 @@ def benchmark_model(
         floor = sampler.min_mem_mhz()
         ceiling = reference_max_mem_mhz()
         blocking = _disqualifying_throttles(loaded)
+
+        if not clock_gated:
+            runs.append(run)
+            run_mean_clocks.append(sampler.mean_mem_mhz())
+            if verbose:
+                where = "CPU-only" if n_gpu_layers == 0 else "partial offload"
+                at = f" at {floor:.0f} MHz" if floor > 0 else ""
+                print(f"  [accept] {run.get('decode_tps', UNKNOWN):.2f} t/s "
+                      f"({where}, floor not applied{at})")
+            continue
 
         if not loaded or floor < 0 or ceiling <= 0:
             reason = f"attempt {attempt}: no clock telemetry during run"
@@ -1230,7 +1328,7 @@ def benchmark_model(
     # Rejections on their own are expected and fine — they are the mechanism
     # working. What disqualifies an aggregate is a warmup that never settled,
     # too few surviving runs, or surviving runs that ran at different clocks.
-    coherent, clock_spread = _clocks_are_coherent(run_mean_clocks, decode)
+    coherent, clock_spread = _clocks_are_coherent(run_mean_clocks, decode, gated=clock_gated)
     if not warmup_converged or len(runs) < n_runs or not coherent:
         source = "unstable_clocks"
         if verbose:
@@ -1289,7 +1387,11 @@ def benchmark_model(
         # Recorded so a suspect row can be attributed after the fact. Without
         # these the 2026-08-04 sweep's bimodality was uninvestigable from the
         # CSV alone and had to be reconstructed from stdout logs.
-        "pstate": _modal_pstate(clock_samples),
+        # "cpu_only" rather than "unknown": the clock was not unobservable, it
+        # was irrelevant, and the two should not read the same in the CSV. A
+        # partial-offload row still reports its real P-state — the clock is
+        # meaningful there, it just is not a gate.
+        "pstate": "cpu_only" if n_gpu_layers == 0 else _modal_pstate(clock_samples),
         # Mean across accepted runs only — the clock the published number was
         # actually produced at, not an average over rejected attempts too.
         "mem_clock_mhz": round(

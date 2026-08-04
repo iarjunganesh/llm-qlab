@@ -6,15 +6,15 @@ Usage:
 
 Results are saved to results/benchmark_results.csv.
 
-Measurement methodology lives in bench_core.py — see the module docstring
+Measurement methodology lives in llm_qlab/bench_core.py — see the module docstring
 there for why prefill and decode are timed via llama.cpp's perf counters
-rather than wall clock. CSV schema and migration live in results_schema.py.
+rather than wall clock. CSV schema and migration live in llm_qlab/results_schema.py.
 """
 
 import argparse
 
-from bench_core import DEFAULT_PROMPT, DEFAULT_PROMPT_TOKENS, benchmark_model
-from results_schema import save_result
+from llm_qlab.bench_core import DEFAULT_PROMPT, DEFAULT_PROMPT_TOKENS, benchmark_model
+from llm_qlab.results_schema import save_result
 
 
 # ---------------------------------------------------------------------------

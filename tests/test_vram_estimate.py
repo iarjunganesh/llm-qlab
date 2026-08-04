@@ -10,7 +10,7 @@ table on the host even at full offload.
 
 import pytest
 
-from bench_core import (
+from llm_qlab.bench_core import (
     UNKNOWN,
     _meta_int,
     bytes_per_weight,

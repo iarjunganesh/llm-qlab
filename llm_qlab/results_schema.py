@@ -1,5 +1,5 @@
 """
-results_schema.py — CSV schema and migration for benchmark results.
+llm_qlab/results_schema.py — CSV schema and migration for benchmark results.
 
 Deliberately free of any llama_cpp import so that analysis tooling
 (compare_quants.py) runs on machines without a CUDA build of
@@ -99,6 +99,12 @@ COMPATIBLE_SCHEMAS = [
 # harness had reported as converged. Excluded from charts and tables, kept in
 # the file so the history is auditable.
 UNSTABLE_MARKER = "unstable_clocks"
+
+# A configuration refused before loading, because its weights plus KV cache and
+# CUDA session would not fit in free VRAM. Not a measurement at all: the row
+# exists so the refusal is recorded rather than the configuration silently
+# missing from the results.
+SKIPPED_MARKER = "skipped_insufficient_vram"
 
 LEGACY_MARKER = "legacy_invalid"
 

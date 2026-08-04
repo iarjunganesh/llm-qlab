@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Tests live in tests/ but import both the llm_qlab package and the root-level
+# CLI modules (compare_quants). Putting the repository root on the path keeps
+# both reachable without the tests needing sys.path surgery of their own.
+pythonpath = ["."]
+testpaths = ["tests"]

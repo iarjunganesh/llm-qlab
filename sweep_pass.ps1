@@ -23,15 +23,26 @@
 .PARAMETER Force
     Continue past preflight warnings instead of stopping.
 
+.PARAMETER SkipLadder
+    Skip the offload ladder. The ladder roughly triples runtime because its
+    CPU-only steps decode at about a seventh of full-offload speed.
+
+.PARAMETER LadderRuns
+    Runs per ladder step. Default 3 — the ladder has 18 steps, so the cost of
+    an extra run is paid many times over.
+
 .EXAMPLE
     .\sweep_pass.ps1
+    .\sweep_pass.ps1 -SkipLadder
     .\sweep_pass.ps1 -Runs 7 -Tag pass-D
 #>
 [CmdletBinding()]
 param(
     [int]$Runs = 5,
     [string]$Tag = (Get-Date -Format "yyyyMMdd-HHmm"),
-    [switch]$Force
+    [switch]$Force,
+    [switch]$SkipLadder,
+    [int]$LadderRuns = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -147,6 +158,35 @@ foreach ($c in $configs) {
         Select-String -Pattern "accept|reject|Warmed up|warn|skip|Geometry|Decode t|Timing source"
 }
 
+# --- Offload ladder -------------------------------------------------------
+
+# Q4_K_M throughout: the ladder asks how throughput moves as layers migrate
+# between CPU and GPU, so holding the quantization format fixed keeps that the
+# only variable. Steps stay at 32 and 99 because llama.cpp counts the output
+# layer separately from the transformer blocks, and the gap between those two
+# values is what makes that visible.
+if (-not $SkipLadder) {
+    $ladder = @(
+        @{f = "llama2";  m = "models/llama-2-7b-chat.Q4_K_M.gguf" },
+        @{f = "mistral"; m = "models/mistral-7b-instruct-v0.1.Q4_K_M.gguf" },
+        @{f = "qwen2.5"; m = "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf" }
+    )
+    Write-Host "`n=== Offload ladder: $($ladder.Count) families x 6 steps ===" -ForegroundColor Cyan
+    Write-Host "CPU-only steps are slow by nature — expect this stage to dominate runtime.`n"
+
+    foreach ($c in $ladder) {
+        if (-not (Test-Path $c.m)) {
+            Write-Host "[skip] ladder $($c.f): model file not found" -ForegroundColor Yellow
+            continue
+        }
+        Write-Host "--- ladder $($c.f) Q4_K_M  $(Get-Date -Format HH:mm:ss) ---" -ForegroundColor Cyan
+        & $python offload_ladder.py --model $c.m --quant-type Q4_K_M --model-family $c.f `
+            --steps 0,8,16,24,32,99 --n-runs $LadderRuns *>&1 |
+            Tee-Object -FilePath "$logDir/ladder-$($c.f).log" |
+            Select-String -Pattern "n_gpu_layers=|accept|reject|warn|skip|CPU-only|Decode t|Timing source|saved"
+    }
+}
+
 # --- Charts and summary ---------------------------------------------------
 
 Write-Host "`n=== Regenerating charts ===" -ForegroundColor Cyan
@@ -155,9 +195,17 @@ Write-Host "`n=== Regenerating charts ===" -ForegroundColor Cyan
 
 $elapsed = (Get-Date) - $started
 Write-Host ("`n=== Complete in {0:hh\:mm\:ss} ===" -f $elapsed) -ForegroundColor Green
-Write-Host "Rows by timing_source:"
+Write-Host "Quantization sweep rows by timing_source:"
 Import-Csv results/benchmark_results.csv |
     Group-Object timing_source |
     Sort-Object Count -Descending |
     ForEach-Object { Write-Host ("  {0,-28} {1}" -f $_.Name, $_.Count) }
+
+if (Test-Path results/offload_ladder.csv) {
+    Write-Host "`nOffload ladder rows by timing_source:"
+    Import-Csv results/offload_ladder.csv |
+        Group-Object timing_source |
+        Sort-Object Count -Descending |
+        ForEach-Object { Write-Host ("  {0,-28} {1}" -f $_.Name, $_.Count) }
+}
 Write-Host "`nOnly perf_counters rows are published. Anything else was refused or flagged.`n"

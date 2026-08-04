@@ -11,8 +11,8 @@ import csv
 
 import pytest
 
-import results_schema as rs
-from results_schema import (
+from llm_qlab import results_schema as rs
+from llm_qlab.results_schema import (
     COMPATIBLE_SCHEMAS,
     CSV_FIELDS,
     LEGACY_MARKER,
