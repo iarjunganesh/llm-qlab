@@ -31,6 +31,8 @@ CSV_PATH = RESULTS_DIR / "offload_ladder.csv"
 PLOT_PATH = RESULTS_DIR / "offload_ladder.png"
 
 LADDER_FIELDS = [
+    "model_family",
+    "quant_type",
     "n_gpu_layers",
     "n_runs",
     "decode_tps",
@@ -41,6 +43,8 @@ LADDER_FIELDS = [
     "ttft_ms_std",
     "vram_delta_mb",
     "vram_total_mb",
+    "vram_residency",
+    "offload_state",
     "load_time_s",
     "timing_source",
 ]
@@ -50,13 +54,37 @@ LADDER_FIELDS = [
 # CSV
 # ---------------------------------------------------------------------------
 
-def save_ladder_results(rows: list[dict]) -> None:
+def load_ladder_results() -> list[dict]:
+    """Read previously swept families, tolerating the pre-family schema."""
+    if not CSV_PATH.exists():
+        return []
+    with open(CSV_PATH, newline="") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r.setdefault("model_family", "unknown")
+        r.setdefault("quant_type", "unknown")
+    return rows
+
+
+def save_ladder_results(rows: list[dict]) -> list[dict]:
+    """Merge this sweep into the CSV, replacing only its own (family, quant).
+
+    Sweeping a second model used to overwrite the first, so the ladder could
+    never hold more than one family. Rows are keyed so each family accumulates
+    and a re-run of one family refreshes just that family.
+    """
     RESULTS_DIR.mkdir(exist_ok=True)
+    key = {(r["model_family"], r["quant_type"]) for r in rows}
+    kept = [r for r in load_ladder_results() if (r["model_family"], r["quant_type"]) not in key]
+    merged = kept + rows
+
     with open(CSV_PATH, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=LADDER_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
-    print(f"\n[ladder] Results saved to {CSV_PATH}")
+        writer.writerows(merged)
+    families = sorted({r["model_family"] for r in merged})
+    print(f"\n[ladder] Results saved to {CSV_PATH} ({len(merged)} rows, families: {', '.join(families)})")
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -95,39 +123,103 @@ def print_ladder_summary(model_name: str, quant_type: str, rows: list[dict]) -> 
 # Plot
 # ---------------------------------------------------------------------------
 
-def plot_ladder(model_name: str, quant_type: str, rows: list[dict]) -> None:
+SURFACE = "#fcfcfb"
+INK = "#1a1a19"
+MUTED = "#5c5c5a"
+# Same validated categorical slots the comparison charts use, so a family keeps
+# one identity across every figure in the repo.
+CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
+
+
+def plot_ladder(quant_type: str, rows: list[dict]) -> None:
+    """Small multiples over a shared x-axis — one measure per panel.
+
+    Every model family present in *rows* is drawn as its own series, so a
+    single figure answers "does offload behave the same across architectures".
+
+    Deliberately NOT a dual-axis chart. Throughput and memory have unrelated
+    units, so overlaying them on twin y-scales makes the crossing point an
+    artefact of whatever ranges matplotlib happened to choose, and readers
+    infer a relationship that isn't in the data. Stacked panels sharing the
+    x-axis show the same correlation without inventing one.
+    """
     RESULTS_DIR.mkdir(exist_ok=True)
 
-    x = [r["n_gpu_layers"] for r in rows]
-    decode_tps = [r["decode_tps"] for r in rows]
-    decode_err = [r["decode_tps_std"] for r in rows]
-    vram_mb = [r["vram_delta_mb"] for r in rows]
+    families = sorted({r["model_family"] for r in rows})
+    colors = {f: CATEGORICAL[i % len(CATEGORICAL)] for i, f in enumerate(families)}
+    # Even spacing: the ladder steps are ordinal, and a linear axis squeezes
+    # 0-32 into a third of the width just because the last step is 99.
+    steps = sorted({int(r["n_gpu_layers"]) for r in rows})
+    pos = {s: i for i, s in enumerate(steps)}
 
-    fig, ax1 = plt.subplots(figsize=(9, 5))
+    panels = [
+        ("Decode speed", "tokens/sec", "decode_tps", "decode_tps_std", "{:.1f}"),
+        ("Time to first token", "milliseconds", "ttft_ms", "ttft_ms_std", "{:.0f}"),
+        ("VRAM attributable to model", "MB", "vram_delta_mb", None, "{:.0f}"),
+    ]
 
-    color_tps = "#4C9BE8"
-    color_vram = "#E8844C"
-
-    ax1.set_xlabel("n_gpu_layers")
-    ax1.set_ylabel("Decode speed (tokens/sec)", color=color_tps)
-    line1 = ax1.errorbar(
-        x, decode_tps, yerr=decode_err, marker="o", color=color_tps,
-        capsize=3, label="decode t/s",
+    fig, axes = plt.subplots(
+        len(panels), 1, figsize=(10, 10), sharex=True, facecolor=SURFACE
     )
-    ax1.tick_params(axis="y", labelcolor=color_tps)
 
-    ax2 = ax1.twinx()
-    ax2.set_ylabel("VRAM attributable to model (MB)", color=color_vram)
-    line2 = ax2.plot(x, vram_mb, marker="s", color=color_vram, label="VRAM (MB)")
-    ax2.tick_params(axis="y", labelcolor=color_vram)
+    for ax, (title, unit, col, err_col, fmt) in zip(axes, panels):
+        ax.set_facecolor(SURFACE)
+        hi, lo = float("-inf"), float("inf")
 
-    handles = [line1, line2[0]]
-    ax1.legend(handles, [h.get_label() for h in handles], loc="upper left")
+        for fam in families:
+            series = sorted((r for r in rows if r["model_family"] == fam),
+                            key=lambda r: int(r["n_gpu_layers"]))
+            xs = [pos[int(r["n_gpu_layers"])] for r in series]
+            values = [float(r[col]) for r in series]
+            errs = [float(r[err_col]) for r in series] if err_col else [0.0] * len(values)
 
-    n_runs = rows[0]["n_runs"] if rows else 0
-    plt.title(f"GPU Offload Ladder — {model_name} {quant_type} (median of {n_runs} runs)")
-    fig.tight_layout()
-    plt.savefig(PLOT_PATH, dpi=150)
+            ax.errorbar(
+                xs, values, yerr=errs if err_col else None, marker="o", markersize=7,
+                linewidth=2, color=colors[fam], capsize=3, ecolor="#8a8a87",
+                elinewidth=1, markeredgecolor=SURFACE, markeredgewidth=1.5, label=fam,
+            )
+            hi = max(hi, max(v + e for v, e in zip(values, errs)))
+            lo = min(lo, min(v - e for v, e in zip(values, errs)))
+
+            # Endpoint labels only, and only for a single series — with several
+            # families the values share an x position and overprint each other.
+            # Identity then comes from the legend, magnitude from the axis.
+            if len(families) == 1:
+                for idx in (0, len(values) - 1):
+                    ax.annotate(fmt.format(values[idx]), (xs[idx], values[idx] + errs[idx]),
+                                textcoords="offset points", xytext=(0, 7), ha="center",
+                                fontsize=8, color=INK)
+
+        span = (hi - lo) or 1.0
+        ax.set_title(f"{title} ({unit})", color=INK, fontsize=11, loc="left")
+        ax.grid(axis="y", color="#e4e4e1", linewidth=0.8)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color("#c9c9c5")
+        ax.tick_params(colors=MUTED, length=0)
+        # Bound the view to data *including* error bars — clipping a whisker
+        # hides exactly the variance the error bar exists to show.
+        ax.set_ylim(lo - span * 0.12, hi + span * 0.18)
+
+    axes[-1].set_xticks(range(len(steps)))
+    axes[-1].set_xticklabels([str(s) for s in steps])
+    axes[-1].set_xlabel("n_gpu_layers (layers offloaded to GPU)", color=MUTED)
+
+    if len(families) > 1:
+        handles, labels_ = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels_, title="Model family", frameon=False,
+                   loc="upper center", bbox_to_anchor=(0.5, 0.945),
+                   ncol=len(families), fontsize=9)
+
+    n_runs = rows[0].get("n_runs", 0) if rows else 0
+    fig.suptitle(
+        f"GPU offload ladder — {quant_type} (median of {n_runs} runs)",
+        fontsize=14, fontweight="bold", color=INK,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.92 if len(families) > 1 else 0.97))
+    plt.savefig(PLOT_PATH, dpi=150, facecolor=SURFACE)
     print(f"[ladder] Plot saved to {PLOT_PATH}")
 
 
@@ -142,6 +234,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Path to the GGUF model file.")
     parser.add_argument("--quant-type", default="unknown",
                         help="Label for the quantization type, e.g. Q4_K_M.")
+    parser.add_argument("--model-family", default="unknown",
+                        help="Model family label, e.g. llama2, mistral, qwen2.5. "
+                             "Each family accumulates in the ladder CSV and plot.")
     parser.add_argument("--steps", default="0,8,16,24,32,99",
                         help="Comma-separated n_gpu_layers values to sweep (default: 0,8,16,24,32,99).")
     parser.add_argument("--n-predict", type=int, default=128,
@@ -162,27 +257,29 @@ def main() -> None:
 
     try:
         steps = [int(s.strip()) for s in args.steps.split(",") if s.strip()]
-    except ValueError:
-        raise SystemExit("[error] --steps must be a comma-separated list of integers.")
+    except ValueError as exc:
+        raise SystemExit("[error] --steps must be a comma-separated list of integers.") from exc
 
     model_name = Path(args.model).stem
     rows = []
 
     for n_layers in steps:
         print(f"\n[ladder] === n_gpu_layers={n_layers} ===")
-        rows.append(
-            benchmark_model(
-                args.model,
-                n_gpu_layers=n_layers,
-                prompt=args.prompt,
-                n_predict=args.n_predict,
-                n_runs=args.n_runs,
-            )
+        row = benchmark_model(
+            args.model,
+            n_gpu_layers=n_layers,
+            prompt=args.prompt,
+            n_predict=args.n_predict,
+            n_runs=args.n_runs,
         )
+        row["model_family"] = args.model_family
+        row["quant_type"] = args.quant_type
+        rows.append(row)
 
     print_ladder_summary(model_name, args.quant_type, rows)
-    save_ladder_results(rows)
-    plot_ladder(model_name, args.quant_type, rows)
+    merged = save_ladder_results(rows)
+    # Plot every family accumulated so far, not just the one just swept.
+    plot_ladder(args.quant_type, merged)
 
 
 if __name__ == "__main__":

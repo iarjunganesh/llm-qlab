@@ -29,9 +29,19 @@ venv/
 Thumbs.db
 
 # Project-specific
-results/*.csv
 !results/*.png
 results/*.log
 *.gguf
 models/
 .tmp/
+
+# Local evidence, not artefacts: per-run logs, archived sweeps, migration backups
+results/logs/
+results/archive/
+results/*.legacy.*.csv
+results/*.pre-rerun-*.csv
+.pytest_cache/
+
+# Personal correspondence and job-application material — this repo is public.
+linkedin-*.txt
+*-recruiter-*.txt

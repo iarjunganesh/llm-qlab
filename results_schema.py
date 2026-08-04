@@ -34,6 +34,11 @@ CSV_FIELDS = [
     "ttft_ms_std",
     "vram_delta_mb",
     "vram_total_mb",
+    "vram_residency",
+    "offload_state",
+    "pstate",
+    "mem_clock_mhz",
+    "throttle_reasons",
     "load_time_s",
     "model_size_mb",
     "timing_source",
@@ -62,6 +67,39 @@ LEGACY_SCHEMAS = [
     ],
 ]
 
+# Older layouts whose *data* is still valid — they simply predate columns added
+# later. Rows are widened with defaults and keep their measured values.
+#
+# This distinction matters: an earlier revision treated "older schema" and
+# "untrustworthy data" as the same thing, so adding two columns silently
+# invalidated every existing row and the results file read as empty.
+COMPATIBLE_SCHEMAS = [
+    # pre-clock-telemetry (before pstate / mem_clock_mhz / throttle_reasons)
+    [
+        "model_name", "model_family", "quant_type", "n_gpu_layers", "n_runs",
+        "prompt_tokens", "generated_tokens", "prefill_tps", "prefill_tps_std",
+        "decode_tps", "decode_tps_std", "ttft_ms", "ttft_ms_std",
+        "vram_delta_mb", "vram_total_mb", "vram_residency", "offload_state",
+        "load_time_s", "model_size_mb", "timing_source",
+    ],
+    # pre-residency (before vram_residency / offload_state)
+    [
+        "model_name", "model_family", "quant_type", "n_gpu_layers", "n_runs",
+        "prompt_tokens", "generated_tokens", "prefill_tps", "prefill_tps_std",
+        "decode_tps", "decode_tps_std", "ttft_ms", "ttft_ms_std",
+        "vram_delta_mb", "vram_total_mb", "load_time_s", "model_size_mb",
+        "timing_source",
+    ],
+]
+
+# Rows whose throughput was measured without clock-state verification. The
+# numbers are not wrong the way LEGACY_SCHEMAS rows are wrong — they were timed
+# correctly — but they carry no evidence the card was in a consistent power
+# state, and a 2026-08-04 audit found up to 27% drift between runs that the
+# harness had reported as converged. Excluded from charts and tables, kept in
+# the file so the history is auditable.
+UNSTABLE_MARKER = "unstable_clocks"
+
 LEGACY_MARKER = "legacy_invalid"
 
 
@@ -81,8 +119,14 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 def normalize_row(values: list[str]) -> dict | None:
     """Coerce a CSV row from any known schema into the current one."""
+    row: dict[str, Any]
     if len(values) == len(CSV_FIELDS):
         row = dict(zip(CSV_FIELDS, values))
+        legacy = False
+    elif any(len(values) == len(s) for s in COMPATIBLE_SCHEMAS):
+        # Widened, not invalidated: the measurements are still good.
+        schema = next(s for s in COMPATIBLE_SCHEMAS if len(values) == len(s))
+        row = dict(zip(schema, values))
         legacy = False
     else:
         for schema in LEGACY_SCHEMAS:
@@ -120,6 +164,14 @@ def normalize_row(values: list[str]) -> dict | None:
         "ttft_ms_std": round(safe_float(row.get("ttft_ms_std", 0.0)), 2),
         "vram_delta_mb": round(safe_float(row.get("vram_delta_mb", UNKNOWN), UNKNOWN), 1),
         "vram_total_mb": round(safe_float(row.get("vram_total_mb", UNKNOWN), UNKNOWN), 1),
+        "vram_residency": round(safe_float(row.get("vram_residency", UNKNOWN), UNKNOWN), 3),
+        "offload_state": row.get("offload_state") or "unknown",
+        # Rows predating clock telemetry get "unknown" rather than a plausible
+        # default: not recording the P-state is exactly what made the earlier
+        # sweep uninvestigable, and inventing one would repeat that.
+        "pstate": row.get("pstate") or "unknown",
+        "mem_clock_mhz": round(safe_float(row.get("mem_clock_mhz", UNKNOWN), UNKNOWN), 0),
+        "throttle_reasons": row.get("throttle_reasons") or "unknown",
         "load_time_s": round(safe_float(row.get("load_time_s", 0.0)), 2),
         "model_size_mb": round(safe_float(row.get("model_size_mb", 0.0)), 1),
         "timing_source": row.get("timing_source") or "unknown",
@@ -168,13 +220,39 @@ def ensure_csv_schema() -> None:
         print(f"[warn] Skipped {skipped} malformed row(s) during migration.")
 
 
-def save_result(result: dict) -> None:
+def save_result(result: dict, *, attempts: int = 6) -> None:
+    """Append a result row, retrying while the CSV is locked.
+
+    On Windows the results file is routinely held open by Excel, an editor, or
+    anything tailing it — and a transient lock here throws away a benchmark run
+    that already cost minutes of GPU time. Retry with backoff, and if the file
+    is still unavailable, write the row to a sidecar so the measurement
+    survives for manual recovery rather than being lost to a formatting detail.
+    """
     RESULTS_DIR.mkdir(exist_ok=True)
-    ensure_csv_schema()
-    write_header = not CSV_PATH.exists()
-    with open(CSV_PATH, "a", newline="") as f:
+
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            ensure_csv_schema()
+            write_header = not CSV_PATH.exists()
+            with open(CSV_PATH, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(result)
+            print(f"Result saved to {CSV_PATH}")
+            return
+        except PermissionError as exc:
+            last_error = exc
+            delay = 0.5 * (2 ** attempt)
+            print(f"[warn] {CSV_PATH} is locked (attempt {attempt + 1}/{attempts}); retrying in {delay:.1f}s")
+            time.sleep(delay)
+
+    rescue = CSV_PATH.with_name(f"{CSV_PATH.stem}.rescued.{int(time.time())}{CSV_PATH.suffix}")
+    with open(rescue, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        if write_header:
-            writer.writeheader()
+        writer.writeheader()
         writer.writerow(result)
-    print(f"Result saved to {CSV_PATH}")
+    print(f"[error] Could not append to {CSV_PATH} after {attempts} attempts: {last_error}")
+    print(f"[error] Row preserved at {rescue} — merge it manually once the lock clears.")

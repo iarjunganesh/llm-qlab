@@ -13,7 +13,7 @@ rather than wall clock. CSV schema and migration live in results_schema.py.
 
 import argparse
 
-from bench_core import DEFAULT_PROMPT, benchmark_model
+from bench_core import DEFAULT_PROMPT, DEFAULT_PROMPT_TOKENS, benchmark_model
 from results_schema import save_result
 
 
@@ -46,10 +46,19 @@ def print_summary(result: dict) -> None:
     print(f"  Model size (MB)  : {result['model_size_mb']:.1f}")
     print(f"  Timing source    : {result['timing_source']}")
     print("=" * 58)
-    if result["timing_source"] != "perf_counters":
+    # Two distinct failure modes, and conflating them misreports both: a
+    # wall-clock estimate is a timing-path problem, an unstable-clock row was
+    # timed correctly but under a power state that makes it unpublishable.
+    if result["timing_source"] == "wall_clock_estimate":
         print(
             "  [warn] llama.cpp perf counters unavailable — throughput is a\n"
             "         wall-clock estimate. Prefill in particular reads low."
+        )
+        print("=" * 58)
+    elif result["timing_source"] == "unstable_clocks":
+        print(
+            "  [warn] GPU clock state was not verified for this row. The\n"
+            "         numbers above are excluded from charts and tables."
         )
         print("=" * 58)
     print()
@@ -64,8 +73,13 @@ def parse_args() -> argparse.Namespace:
         description="Benchmark a GGUF model with llama-cpp-python."
     )
     parser.add_argument("--model", required=True, help="Path to the GGUF model file.")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT,
-                        help="Prompt to use for benchmarking.")
+    parser.add_argument("--prompt", default=None,
+                        help="Literal prompt to benchmark. Overrides --prompt-tokens, "
+                             "which means prompt length will vary between tokenizers.")
+    parser.add_argument("--prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS,
+                        help=f"Prefill length in tokens, held equal across models "
+                             f"(default: {DEFAULT_PROMPT_TOKENS}). Too short a prompt "
+                             f"measures per-call overhead instead of throughput.")
     parser.add_argument("--n-predict", type=int, default=128,
                         help="Number of tokens to generate (default: 128).")
     parser.add_argument("--n-gpu-layers", type=int, default=99,
@@ -86,7 +100,8 @@ def main() -> None:
     result = benchmark_model(
         args.model,
         n_gpu_layers=args.n_gpu_layers,
-        prompt=args.prompt,
+        prompt=args.prompt if args.prompt is not None else DEFAULT_PROMPT,
+        target_prompt_tokens=0 if args.prompt is not None else args.prompt_tokens,
         n_predict=args.n_predict,
         n_runs=args.n_runs,
         warmup=not args.no_warmup,

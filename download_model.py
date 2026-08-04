@@ -55,8 +55,11 @@ def download_model(repo_id: str, filename: str, output_name: str | None = None):
     token = os.getenv("HF_TOKEN")
     
     output_name = output_name or filename
-    output_path = models_dir / output_name
-    
+    # Resolve before comparing: hf_hub_download returns an absolute path, so an
+    # unresolved relative output_path never compares equal to it and the rename
+    # below fires even when source and destination are the same file.
+    output_path = (models_dir / output_name).resolve()
+
     print(f"⏳ Downloading {filename}...")
     print(f"   From: {repo_id}")
     print(f"   To: {output_path}")
@@ -72,8 +75,10 @@ def download_model(repo_id: str, filename: str, output_name: str | None = None):
                 local_dir=models_dir,
                 token=token,
             )
-        )
+        ).resolve()
 
+        # Only rename when the download actually landed somewhere else, e.g.
+        # when --output requests a different name.
         if downloaded_path != output_path:
             if output_path.exists():
                 output_path.unlink()

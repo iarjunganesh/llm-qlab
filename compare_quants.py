@@ -23,11 +23,30 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from results_schema import CSV_FIELDS, CSV_PATH, LEGACY_MARKER, normalize_row
+from results_schema import (
+    CSV_FIELDS, CSV_PATH, LEGACY_MARKER, UNSTABLE_MARKER, normalize_row,
+)
+
+# Neither marker denotes a publishable measurement, for different reasons:
+# legacy rows were timed by a broken path, unstable rows were timed correctly
+# but without evidence the GPU held a consistent clock state.
+EXCLUDED_SOURCES = (LEGACY_MARKER, UNSTABLE_MARKER)
 
 RESULTS_DIR = Path("results")
 OUTPUT_PNG = RESULTS_DIR / "comparison.png"
 OUTPUT_PNG_FAMILY = RESULTS_DIR / "comparison_by_family.png"
+
+# Categorical slots 1-3, validated for colourblind separation against the light
+# chart surface (worst adjacent pair ΔE 9.2 deutan / 27.6 normal). The aqua slot
+# sits below 3:1 contrast, so every bar carries a direct value label.
+CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
+SURFACE = "#fcfcfb"
+INK = "#1a1a19"
+MUTED = "#5c5c5a"
+
+# Quantization is ordinal — keep charts in bit-depth order, not discovery order.
+QUANT_ORDER = ["Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M",
+               "Q5_0", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
 
 # Schema handling is shared with benchmark.py — see results_schema.py.
 
@@ -43,6 +62,29 @@ def _load_resilient() -> pd.DataFrame:
         return pd.DataFrame(columns=CSV_FIELDS)
     rows = [r for r in (normalize_row(raw) for raw in all_rows[1:]) if r is not None]
     return pd.DataFrame(rows, columns=CSV_FIELDS)
+
+
+CONFIG_KEY = ["model_name", "quant_type", "n_gpu_layers"]
+
+
+def _keep_latest_per_config(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse repeated measurements of one configuration to the newest.
+
+    benchmark.py appends rather than replaces, so re-running a configuration —
+    which is exactly what the harness tells you to do when a row comes back
+    flagged — leaves the old row in the file. Both then reach the charts, and
+    which one a lookup returns depends on row order rather than recency. That
+    would let a superseded number be published after it had been re-measured.
+
+    Rows are in append order, so the last occurrence is the newest.
+    """
+    if not set(CONFIG_KEY).issubset(df.columns):
+        return df
+    superseded = len(df) - len(df.drop_duplicates(subset=CONFIG_KEY, keep="last"))
+    if superseded:
+        print(f"[info] {superseded} superseded row(s) ignored — a newer "
+              "measurement exists for the same configuration.")
+    return df.drop_duplicates(subset=CONFIG_KEY, keep="last").reset_index(drop=True)
 
 
 def load_results() -> pd.DataFrame:
@@ -62,12 +104,23 @@ def load_results() -> pd.DataFrame:
         print("[error] Results file is empty. Run benchmark.py first.")
         sys.exit(1)
 
+    df = _keep_latest_per_config(df)
+
     stale = df[df["timing_source"] == LEGACY_MARKER]
     if not stale.empty:
         print(
             f"[warn] {len(stale)} row(s) predate the prefill-timing fix and have no "
             "valid throughput. They are excluded from charts and tables — re-run "
             "benchmark.py for those configurations."
+        )
+
+    unstable = df[df["timing_source"] == UNSTABLE_MARKER]
+    if not unstable.empty:
+        print(
+            f"[warn] {len(unstable)} row(s) were measured without a verified GPU "
+            "clock state and are excluded from charts and tables. Re-run those "
+            "configurations with the machine otherwise idle and the power profile "
+            "set to its highest setting."
         )
 
     return df
@@ -103,42 +156,93 @@ def _fmt(value: float, decimals: int = 2) -> str:
 # Plotting
 # ---------------------------------------------------------------------------
 
+def _family_colors(families: list[str]) -> dict[str, str]:
+    """Map each family to a fixed categorical slot.
+
+    Keyed on the sorted family name rather than row order, so filtering the
+    data cannot repaint the surviving series — colour follows the entity.
+    """
+    return {fam: CATEGORICAL[i % len(CATEGORICAL)] for i, fam in enumerate(sorted(families))}
+
+
+def _grouped_bars(ax, agg, families, quants, colors, value_col, err_col, fmt):
+    """Draw one grouped-bar panel: quant on x, one coloured bar per family."""
+    # 2px surface gap between adjacent bars at 150 dpi.
+    slot = 0.8 / len(families)
+    bar_width = slot - (2 / 150) / max(len(quants), 1)
+
+    for i, fam in enumerate(families):
+        values, errors = [], []
+        for q in quants:
+            sel = agg[(agg["model_family"] == fam) & (agg["quant_type"] == q)]
+            v = float("nan") if sel.empty else sel[value_col].iloc[0]
+            e = 0.0 if sel.empty or err_col is None or pd.isna(sel[err_col].iloc[0]) else sel[err_col].iloc[0]
+            values.append(0.0 if pd.isna(v) else v)
+            errors.append(e)
+
+        offset = (i - len(families) / 2) * slot + slot / 2
+        positions = [xi + offset for xi in range(len(quants))]
+        ax.bar(
+            positions, values, width=bar_width, label=fam,
+            color=colors[fam], edgecolor=SURFACE, linewidth=0.5,
+            yerr=errors if any(errors) else None, capsize=3,
+            error_kw={"elinewidth": 1, "ecolor": "#5c5c5a"},
+        )
+        # Direct labels satisfy the relief requirement for the low-contrast slot.
+        # Sit them above the error-bar cap, not the bar top, or they collide.
+        span = max([v for v in values if v > 0], default=1.0)
+        for px, v, e in zip(positions, values, errors):
+            if v > 0:
+                ax.text(px, v + e + span * 0.02, fmt.format(v),
+                        ha="center", va="bottom", fontsize=7, color=INK)
+
+    ax.set_xticks(range(len(quants)))
+    ax.set_xticklabels(quants)
+    ax.grid(axis="y", color="#e4e4e1", linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color("#c9c9c5")
+    ax.tick_params(colors=MUTED, length=0)
+    ax.margins(y=0.18)
+
+
 def plot_comparison(df: pd.DataFrame) -> None:
+    """Decode throughput and VRAM, every family shown side by side per quant."""
     RESULTS_DIR.mkdir(exist_ok=True)
-    agg = _aggregate(df, ["quant_type"])
+    agg = _aggregate(df, ["model_family", "quant_type"])
 
-    labels = agg["quant_type"].tolist()
-    x = range(len(labels))
-    bar_width = 0.5
+    families = sorted(agg["model_family"].unique().tolist())
+    quants = [q for q in QUANT_ORDER if q in set(agg["quant_type"])]
+    quants += [q for q in agg["quant_type"].unique() if q not in quants]
+    colors = _family_colors(families)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle("LLM Quantization Comparison — llm-qlab", fontsize=14, fontweight="bold")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor=SURFACE)
+    fig.suptitle("LLM Quantization Comparison — llm-qlab", fontsize=14,
+                 fontweight="bold", color=INK)
 
-    axes[0].bar(
-        x, agg["decode_tps"], width=bar_width, color="#4C9BE8", edgecolor="white",
-        yerr=agg["decode_tps_std"].fillna(0), capsize=4,
-    )
-    axes[0].set_title("Decode Speed (tokens/sec)")
-    axes[0].set_xlabel("Quantization Format")
-    axes[0].set_ylabel("Tokens / second")
-    axes[0].set_xticks(list(x))
-    axes[0].set_xticklabels(labels)
-    for i, v in enumerate(agg["decode_tps"]):
-        if not pd.isna(v):
-            axes[0].text(i, v + 0.5, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
+    for ax in axes:
+        ax.set_facecolor(SURFACE)
 
-    axes[1].bar(x, agg["vram_delta_mb"], width=bar_width, color="#E8844C", edgecolor="white")
-    axes[1].set_title("VRAM Attributable to Model (MB)")
-    axes[1].set_xlabel("Quantization Format")
-    axes[1].set_ylabel("VRAM (MB)")
-    axes[1].set_xticks(list(x))
-    axes[1].set_xticklabels(labels)
-    for i, v in enumerate(agg["vram_delta_mb"]):
-        if not pd.isna(v):
-            axes[1].text(i, v + 5, f"{v:.0f}", ha="center", va="bottom", fontsize=9)
+    _grouped_bars(axes[0], agg, families, quants, colors, "decode_tps", "decode_tps_std", "{:.1f}")
+    axes[0].set_title("Decode speed (tokens/sec)", color=INK, fontsize=11)
+    axes[0].set_xlabel("Quantization format", color=MUTED)
+    axes[0].set_ylabel("Tokens / second", color=MUTED)
 
-    plt.tight_layout()
-    plt.savefig(OUTPUT_PNG, dpi=150)
+    _grouped_bars(axes[1], agg, families, quants, colors, "vram_delta_mb", None, "{:.0f}")
+    axes[1].set_title("VRAM attributable to model (MB)", color=INK, fontsize=11)
+    axes[1].set_xlabel("Quantization format", color=MUTED)
+    axes[1].set_ylabel("VRAM (MB)", color=MUTED)
+
+    # Legend is mandatory for >= 2 series; identity is never colour-alone.
+    # Figure-level and above the panels, so it never covers a bar.
+    handles, labels_ = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels_, title="Model family", frameon=False,
+               loc="upper center", bbox_to_anchor=(0.5, 0.93),
+               ncol=len(families), fontsize=9)
+
+    plt.tight_layout(rect=(0, 0, 1, 0.88))
+    plt.savefig(OUTPUT_PNG, dpi=150, facecolor=SURFACE)
     print(f"Chart saved to {OUTPUT_PNG}")
 
 
@@ -147,15 +251,19 @@ def plot_comparison_by_family(df: pd.DataFrame) -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
     agg = _aggregate(df, ["model_family", "quant_type"])
 
-    families = agg["model_family"].unique().tolist()
-    quants = agg["quant_type"].unique().tolist()
+    families = sorted(agg["model_family"].unique().tolist())
+    quants = [q for q in QUANT_ORDER if q in set(agg["quant_type"])]
+    quants += [q for q in agg["quant_type"].unique() if q not in quants]
     bar_width = 0.8 / len(quants)
     x = range(len(families))
 
-    fig, ax = plt.subplots(figsize=(max(8, len(families) * 2), 5))
-    fig.suptitle("Decode t/s by Model Family — llm-qlab", fontsize=14, fontweight="bold")
+    fig, ax = plt.subplots(figsize=(max(8, len(families) * 2), 5), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    fig.suptitle("Decode t/s by Model Family — llm-qlab", fontsize=14,
+                 fontweight="bold", color=INK)
 
-    colors = plt.cm.tab10.colors  # type: ignore[attr-defined]
+    # Quant is ordinal here, so step one hue light->dark rather than cycling hues.
+    colors = ["#9ec5f4", "#5598e7", "#2a78d6", "#1c5cab", "#104281"][-len(quants):]
     for i, quant in enumerate(quants):
         subset = agg[agg["quant_type"] == quant]
         values, errors = [], []
@@ -246,7 +354,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     df = load_results()
-    df = df[df["timing_source"] != LEGACY_MARKER]
+    df = df[~df["timing_source"].isin(EXCLUDED_SOURCES)]
     if df.empty:
         print("[error] No rows with valid timing data. Re-run benchmark.py.")
         sys.exit(1)
