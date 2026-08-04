@@ -152,6 +152,39 @@ def _fmt(value: float, decimals: int = 2) -> str:
     return "n/a" if pd.isna(value) else f"{value:.{decimals}f}"
 
 
+def _quant_order(agg: pd.DataFrame) -> list[str]:
+    quants = [q for q in QUANT_ORDER if q in set(agg["quant_type"])]
+    return quants + [q for q in agg["quant_type"].unique() if q not in quants]
+
+
+def _split_plottable(agg: pd.DataFrame, value_col: str = "decode_tps") -> tuple[list[str], list[str]]:
+    """Separate quant formats that have data from those that have none.
+
+    A configuration that was refused or flagged carries no throughput, and
+    plotting it as a zero-height bar renders an empty slot that reads as a
+    measurement of zero rather than an absence of one. Such formats are named
+    in a caption instead — the fact that Q8_0 does not fit is a finding, but it
+    is not a bar.
+    """
+    plottable, empty = [], []
+    for quant in _quant_order(agg):
+        values = agg.loc[agg["quant_type"] == quant, value_col]
+        (plottable if (values > 0).any() else empty).append(quant)
+    return plottable, empty
+
+
+def _caption_for_empty(fig, empty: list[str]) -> None:
+    """Note omitted quant formats beneath the axes."""
+    if not empty:
+        return
+    fig.text(
+        0.5, 0.015,
+        f"{', '.join(empty)} omitted — exceeds available VRAM on this hardware; "
+        "see README, Known issues.",
+        ha="center", fontsize=8, color=MUTED, style="italic",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
@@ -213,8 +246,10 @@ def plot_comparison(df: pd.DataFrame) -> None:
     agg = _aggregate(df, ["model_family", "quant_type"])
 
     families = sorted(agg["model_family"].unique().tolist())
-    quants = [q for q in QUANT_ORDER if q in set(agg["quant_type"])]
-    quants += [q for q in agg["quant_type"].unique() if q not in quants]
+    quants, empty_quants = _split_plottable(agg)
+    if not quants:
+        print("[error] No quantization format has plottable data.")
+        sys.exit(1)
     colors = _family_colors(families)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor=SURFACE)
@@ -241,7 +276,8 @@ def plot_comparison(df: pd.DataFrame) -> None:
                loc="upper center", bbox_to_anchor=(0.5, 0.93),
                ncol=len(families), fontsize=9)
 
-    plt.tight_layout(rect=(0, 0, 1, 0.88))
+    _caption_for_empty(fig, empty_quants)
+    plt.tight_layout(rect=(0, 0.04 if empty_quants else 0, 1, 0.88))
     plt.savefig(OUTPUT_PNG, dpi=150, facecolor=SURFACE)
     print(f"Chart saved to {OUTPUT_PNG}")
 
@@ -252,8 +288,10 @@ def plot_comparison_by_family(df: pd.DataFrame) -> None:
     agg = _aggregate(df, ["model_family", "quant_type"])
 
     families = sorted(agg["model_family"].unique().tolist())
-    quants = [q for q in QUANT_ORDER if q in set(agg["quant_type"])]
-    quants += [q for q in agg["quant_type"].unique() if q not in quants]
+    quants, empty_quants = _split_plottable(agg)
+    if not quants:
+        print("[error] No quantization format has plottable data.")
+        sys.exit(1)
     bar_width = 0.8 / len(quants)
     x = range(len(families))
 
@@ -291,7 +329,8 @@ def plot_comparison_by_family(df: pd.DataFrame) -> None:
     ax.set_xticklabels(families)
     ax.legend(title="Quant type")
 
-    plt.tight_layout()
+    _caption_for_empty(fig, empty_quants)
+    plt.tight_layout(rect=(0, 0.04 if empty_quants else 0, 1, 1))
     plt.savefig(OUTPUT_PNG_FAMILY, dpi=150)
     print(f"Chart saved to {OUTPUT_PNG_FAMILY}")
 

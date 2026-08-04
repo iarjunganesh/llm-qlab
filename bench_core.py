@@ -26,7 +26,9 @@ silently reporting a number that looks like a measurement but isn't.
 
 from __future__ import annotations
 
+import contextlib
 import gc
+import io
 import re
 import threading
 import statistics
@@ -53,6 +55,12 @@ DEFAULT_PROMPT = (
 # 16x the work while still fitting the 512-token default context alongside 128
 # generated tokens, so it costs no KV cache growth and leaves VRAM comparable.
 DEFAULT_PROMPT_TOKENS = 256
+
+# llama-cpp-python's own default context length. Named here because the KV
+# cache estimate must be computed against the same value the model is actually
+# built with, and a silent divergence between the two would make the headroom
+# check confidently wrong.
+DEFAULT_N_CTX = 512
 
 # Warmup stops once WARMUP_STREAK consecutive discarded runs agree within this
 # fraction. Two was not enough: on llama-2 Q5_K_M two consecutive warmup runs
@@ -265,28 +273,114 @@ def get_vram_free_mb() -> float:
         return UNKNOWN
 
 
-def check_vram_headroom(model_size_mb: float, *, kv_overhead: float = 1.15) -> tuple[bool, str]:
-    """Decide whether the model can actually be held in free VRAM.
+# Fixed device cost of a llama.cpp CUDA session that is not the weights or the
+# KV cache: CUDA context, compute buffers and allocator slack. Measured on this
+# hardware as the gap between vram_delta_mb and device-resident weights across
+# the 2026-08-04 sweep, which ranged 397-737 MB with the KV cache subtracted.
+CUDA_SESSION_OVERHEAD_MB = 420.0
 
-    Weights are not the whole cost — the KV cache, compute buffers and CUDA
-    context add roughly 10-20% on top, so a model that "just fits" on paper
-    does not fit in practice.
+
+def _meta_int(meta: dict[str, Any], suffix: str) -> int:
+    """Look up a GGUF metadata key by suffix, ignoring the architecture prefix.
+
+    Keys are namespaced by architecture — ``llama.block_count`` but
+    ``qwen2.block_count`` — so matching on the prefix would silently return
+    nothing for every model whose architecture was not anticipated.
+    """
+    for key, value in meta.items():
+        if key.endswith("." + suffix):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return -1
+    return -1
+
+
+def read_model_geometry(model_path: str) -> dict[str, int]:
+    """Read attention geometry from a GGUF without uploading its weights.
+
+    ``vocab_only`` parses the metadata header and stops, so this costs a file
+    open rather than a model load — which matters because the whole point is to
+    decide whether the model should be loaded at all.
+    """
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            meta = Llama(model_path=model_path, vocab_only=True, verbose=False).metadata
+    except Exception:
+        return {}
+
+    layers = _meta_int(meta, "block_count")
+    heads = _meta_int(meta, "attention.head_count")
+    kv_heads = _meta_int(meta, "attention.head_count_kv")
+    embedding = _meta_int(meta, "embedding_length")
+
+    # key_length is optional in GGUF and absent from all three families here,
+    # so derive it. Falling back to a guess would defeat the purpose.
+    head_dim = _meta_int(meta, "attention.key_length")
+    if head_dim <= 0 and heads > 0 and embedding > 0:
+        head_dim = embedding // heads
+
+    return {"layers": layers, "heads": heads, "kv_heads": kv_heads,
+            "head_dim": head_dim, "embedding": embedding}
+
+
+def estimate_kv_cache_mb(geometry: dict[str, int], n_ctx: int) -> float:
+    """KV cache size in MB for *n_ctx* tokens.
+
+    A flat percentage of file size cannot express this. Across the three
+    families benchmarked here the KV cache at 512 tokens spans 28 MB
+    (Qwen2.5-7B, 4 KV heads over 28 layers) to 256 MB (Llama-2-7B, full
+    multi-head attention over 32) — a 9x range at nearly identical file sizes.
+    Grouped-query attention is the whole difference and file size cannot see it.
+    """
+    layers = geometry.get("layers", -1)
+    kv_heads = geometry.get("kv_heads", -1)
+    head_dim = geometry.get("head_dim", -1)
+    if min(layers, kv_heads, head_dim) <= 0:
+        return UNKNOWN
+    # 2 tensors (K and V), fp16.
+    return 2 * layers * n_ctx * kv_heads * head_dim * 2 / (1024 * 1024)
+
+
+def check_vram_headroom(model_size_mb: float, *,
+                        device_weight_mb: float = UNKNOWN,
+                        kv_cache_mb: float = UNKNOWN,
+                        kv_overhead: float = 1.15) -> tuple[bool, str]:
+    """Decide whether the model can actually be held in free VRAM.
 
     This exists because a model larger than free VRAM still *runs*: the driver
     silently pages it, and the harness reports a throughput number that is
     really measuring PCIe transfer and whatever else happened to be on the GPU
     at that moment. Those numbers looked like measurements and drifted 20-60%
-    between identical runs. Refusing to present them is the fix — a benchmark
-    that cannot be run under controlled conditions should say so.
+    between identical runs. Refusing to present them is the fix.
+
+    Two inputs make the estimate honest when they are available:
+
+    * *device_weight_mb* — not every byte of a GGUF reaches the device.
+      Qwen2.5-7B keeps ~550 MB of embedding table on the host even at full
+      offload, so its file size overstates VRAM demand by 7%.
+    * *kv_cache_mb* — computed from attention geometry rather than assumed.
+
+    Without them it falls back to the old flat multiplier, which is
+    conservative in both directions and can refuse a model that would fit.
     """
     free = get_vram_free_mb()
     if free < 0:
         return True, "vram telemetry unavailable — proceeding unchecked"
-    required = model_size_mb * kv_overhead
+
+    weights = device_weight_mb if device_weight_mb > 0 else model_size_mb
+    if kv_cache_mb > 0:
+        required = weights + kv_cache_mb + CUDA_SESSION_OVERHEAD_MB
+        detail = (f"weights {weights:.0f} MB + KV {kv_cache_mb:.0f} MB "
+                  f"+ session {CUDA_SESSION_OVERHEAD_MB:.0f} MB")
+    else:
+        required = weights * kv_overhead
+        detail = (f"weights {weights:.0f} MB "
+                  f"+ {int((kv_overhead - 1) * 100)}% runtime, geometry unknown")
+
     if required > free:
-        return False, (f"needs ~{required:.0f} MB (weights {model_size_mb:.0f} MB "
-                       f"+ {int((kv_overhead - 1) * 100)}% runtime) but only {free:.0f} MB free")
-    return True, f"{free:.0f} MB free for ~{required:.0f} MB required"
+        return False, f"needs ~{required:.0f} MB ({detail}) but only {free:.0f} MB free"
+    return True, f"{free:.0f} MB free for ~{required:.0f} MB required ({detail})"
 
 
 def read_clock_state() -> dict[str, Any]:
@@ -863,7 +957,19 @@ def benchmark_model(
     # that is really measuring PCIe traffic — the source of the 20-60% swings on
     # Q8_0 models sitting at 93-98% of an 8 GB card.
     model_size_mb = round(Path(model_path).stat().st_size / (1024 * 1024), 1)
-    fits, headroom_note = check_vram_headroom(model_size_mb) if n_gpu_layers != 0 else (True, "cpu only")
+    if n_gpu_layers != 0:
+        # Geometry comes from the GGUF header, so the KV cache is computed from
+        # attention shape rather than assumed as a share of file size.
+        geometry = read_model_geometry(model_path)
+        kv_mb = estimate_kv_cache_mb(geometry, DEFAULT_N_CTX)
+        if verbose and kv_mb > 0:
+            print(f"Geometry: {geometry['layers']} layers, "
+                  f"{geometry['kv_heads']}/{geometry['heads']} KV heads, "
+                  f"head_dim {geometry['head_dim']} — "
+                  f"KV cache {kv_mb:.0f} MB at n_ctx={DEFAULT_N_CTX}")
+        fits, headroom_note = check_vram_headroom(model_size_mb, kv_cache_mb=kv_mb)
+    else:
+        fits, headroom_note = True, "cpu only"
     if not fits:
         if verbose:
             print(f"[skip] {Path(model_path).name}: {headroom_note}")
