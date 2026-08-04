@@ -198,11 +198,19 @@ than a pair, and flag any row that cannot be measured cleanly as
 `unstable_clocks` so it is excluded from charts rather than merely warned about.
 The effect on the same configuration:
 
-| | Before | After |
-| --- | --- | --- |
-| llama2 Q4_K_M decode | 53.19 / 65.75 across passes | 61.08 ± 1.18 |
-| Reported stdev | ± 1.21 | ± 0.17 on a verification run |
-| Cross-pass drift | 23.6% | clock recorded per row |
+The effect on llama-2 Q4_K_M, the configuration that first showed the split:
+
+| | Before the fix | After, at P2 | After, at P0 |
+| --- | --- | --- | --- |
+| Decode t/s | 53.19 / 65.75 across two passes | 61.08 ± 1.18 | 74.43 ± 0.50 |
+| Clock during measurement | unrecorded | 11101 MHz | 12101 MHz |
+| Cross-pass drift | 23.6% | — | — |
+
+The middle column is the same harness measuring the same model with the clock
+verified but the card unable to reach P0, because it was also driving the
+display. The right column is after that was fixed too. Neither is a speedup over
+the left: all three are the same model on the same GPU, and the differences are
+the measurement conditions the original harness could not see.
 
 The warmup trace caught the mechanism in the act — 49.2 t/s while pinned at
 9001 MHz, stepping to 57 t/s on reaching 11101 MHz, in a single run sequence.
@@ -216,60 +224,67 @@ The warmup trace caught the mechanism in the act — 49.2 t/s while pinned at
 ## Results
 
 Measured 2026-08-04 on the hardware below, Armory Crate **Turbo** profile
-(108 W GPU ceiling against a 55 W default), full GPU offload
+(115 W GPU ceiling) with the dGPU **not driving a display**, full GPU offload
 (`--n-gpu-layers 99`), ~256-token prompt, 127 tokens generated, **median ±
 sample stdev over 5 clock-verified runs** with a discarded warmup. Every row was
-timed via llama.cpp perf counters and every run was verified to have held its
-memory clock throughout — see [clock verification](#throughput-is-only-comparable-at-a-comparable-clock).
+timed via llama.cpp perf counters, reported `offload_state = resident`, and was
+verified to have held its memory clock throughout — see
+[clock verification](#throughput-is-only-comparable-at-a-comparable-clock).
 
 | Family | Quant | Decode t/s | Prefill t/s | TTFT (ms) | Mem clock | VRAM (MB) | Size (MB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| llama2 | Q4_K_M | 61.08 ± 1.18 | 1662.97 ± 54.06 | 156.59 ± 5.31 | 11101 | 4558 | 3892 |
-| llama2 | Q5_K_M | 51.17 ± 0.37 | 1530.23 ± 12.79 | 170.51 ± 1.42 | 11101 | 5047 | 4562 |
-| mistral | Q4_K_M | 59.89 ± 0.51 | 1648.19 ± 16.75 | 157.99 ± 1.63 | 11101 | 4492 | 4166 |
-| mistral | Q5_K_M | 49.07 ± 0.13 | 1472.59 ± 5.03 | 176.77 ± 0.60 | 11141 | 5198 | 4894 |
-| qwen2.5 | Q4_K_M | 60.63 ± 0.08 | 2112.14 ± 2.52 | 123.40 ± 0.14 | 11101 | 4704 | 4466 |
-| qwen2.5 | Q5_K_M | 54.18 ± 0.07 | 2065.78 ± 4.32 | 126.17 ± 0.30 | 11545 | 5364 | 5193 |
+| llama2 | Q4_K_M | 74.43 ± 0.50 | 2788.19 ± 9.14 | 93.86 ± 0.30 | 12101 | 4382 | 3892 |
+| llama2 | Q5_K_M | 65.31 ± 0.37 | 2671.44 ± 9.19 | 97.91 ± 0.33 | 12101 | 5036 | 4562 |
+| llama2 | Q8_0 | 45.78 ± 0.10 | 2829.01 ± 7.22 | 92.59 ± 0.23 | 11561 | 7256 | 6829 |
+| mistral | Q4_K_M | 71.18 ± 0.06 | 2692.24 ± 10.52 | 97.28 ± 0.42 | 12101 | 4480 | 4166 |
+| mistral | Q5_K_M | 62.17 ± 0.33 | 2585.53 ± 5.77 | 101.18 ± 0.26 | 12101 | 5192 | 4894 |
+| mistral | Q8_0 | 43.17 ± 0.17 | 2708.80 ± 12.18 | 96.77 ± 0.42 | 11646 | 7590 | 7339 |
+| qwen2.5 | Q4_K_M | 71.69 ± 0.22 | 3355.53 ± 9.92 | 78.32 ± 0.33 | 12101 | 4704 | 4466 |
+| qwen2.5 | Q5_K_M | 63.15 ± 0.23 | 3269.73 ± 17.44 | 80.21 ± 0.57 | 12101 | 5364 | 5193 |
+| qwen2.5 | Q8_0 | 43.91 ± 0.19 | 3493.31 ± 8.89 | 75.24 ± 0.26 | 11665 | 7700 | 7723 |
 
-All three Q8_0 configurations were **refused, not measured** — see
-[the 8 GB ceiling](#q8_0-does-not-fit-an-8-gb-card).
+All nine configurations measured cleanly, including Q8_0 — which required
+taking the display off the discrete GPU. See
+[fitting Q8_0 on 8 GB](#fitting-q8_0-on-an-8-gb-card).
 
 ![Quantization comparison](results/comparison.png)
 
-**Prefill runs roughly 30x decode.** Prefill processes the prompt in parallel
-and is compute-bound; decode emits one token at a time and is
-memory-bandwidth-bound. An earlier revision of this README reported ~10x from a
-16-token prompt, which is too short to saturate the GPU and understates prefill.
-The original pre-fix numbers had the ratio *inverted* — see the case study above.
+**Prefill runs 40-75x decode.** Prefill processes the prompt in parallel and is
+compute-bound; decode emits one token at a time and is memory-bandwidth-bound.
+An earlier revision of this README reported ~10x from a 16-token prompt, which
+is too short to saturate the GPU and understates prefill. The original pre-fix
+numbers had the ratio *inverted* — see the case study above.
 
 ### Does the data behave like memory bandwidth?
 
-If decode is bandwidth-bound, `decode_tps × model_size` should be roughly
-constant within a family — the same bytes-per-second moving through the memory
-system regardless of how the weights are quantized.
+If decode is bandwidth-bound, `decode_tps × weights` should be roughly constant
+within a family — the same bytes-per-second moving through the memory system
+regardless of how the weights are quantized. Weights here are device-resident
+bytes rather than file size, since the embedding table stays on the host.
 
-| Family | Q4_K_M | Q5_K_M | Ratio |
-| --- | --- | --- | --- |
-| llama2 | 237.7 GB/s | 233.4 GB/s | 0.98 |
-| mistral | 249.5 GB/s | 240.1 GB/s | 0.96 |
-| qwen2.5 | 270.8 GB/s | 281.4 GB/s | 1.04 |
+| Family | Q4_K_M | Q5_K_M | Q8_0 | Spread |
+| --- | --- | --- | --- | --- |
+| llama2 | 284.4 GB/s | 292.3 GB/s | 306.6 GB/s | 7.2% |
+| mistral | 291.5 GB/s | 298.9 GB/s | 311.1 GB/s | 6.3% |
+| qwen2.5 | 299.2 GB/s | 305.4 GB/s | 314.9 GB/s | 5.0% |
 
-Within 4% in every family. This is the check the previous sweep failed: Qwen2.5
+Decode falls monotonically with size in every family — Q4_K_M > Q5_K_M > Q8_0,
+nine rows, no exceptions. This is the check the previous sweep failed: Qwen2.5
 Q5_K_M decoded *faster* than its own Q4_K_M despite being 16% larger, and did so
-reproducibly across two passes. That inversion is gone, and it was a clock
-artifact rather than a property of the model.
+reproducibly across two passes. That inversion is gone; it was a clock artifact.
 
-Qwen sustains ~15% more effective bandwidth than Llama-2 across both quants.
-That is consistent with its placement: Qwen2.5-7B has 28 transformer layers to
-Llama-2's 32 and keeps a much larger embedding table on the host
-(`vram_residency` 0.93 versus 0.98), so less weight traffic crosses the memory
-bus per token than file size alone suggests.
+Effective bandwidth is not perfectly flat — it rises 5-7% from Q4_K_M to Q8_0.
+Two candidate explanations, neither yet tested: fixed per-token cost (sampling,
+kernel launch, the Python loop) is amortized better at 44 t/s than at 74, and
+Q8_0 dequantization is arithmetically trivial next to a K-quant, so the larger
+format sits closer to being purely bandwidth-bound. The trend is consistent in
+direction and magnitude across all three families.
 
 > **Not comparable to earlier revisions of this table.** Prompt length, the
-> VRAM-release fix and clock verification all changed between sweeps. Decode is
-> roughly double what this README reported on 2026-08-03, and most of that is a
-> change in *measurement conditions*, not a speedup. The older numbers were
-> averages over an unrecorded mix of memory P-states.
+> VRAM-release fix, clock verification, the power profile and the display mode
+> all changed across sweeps. Decode is roughly triple what this README reported
+> on 2026-08-03. Almost none of that is a speedup — it is measurement conditions
+> that were previously uncontrolled and unrecorded.
 
 ### GPU offload ladder — withheld pending re-measurement
 
@@ -297,29 +312,51 @@ of the models and the loader rather than of the timing path:
 This section exists because a benchmark that hides its unstable numbers is
 worth less than one that names them.
 
-### Q8_0 does not fit an 8 GB card
+### Fitting Q8_0 on an 8 GB card
 
-All three Q8_0 configurations are **refused before loading**, and this is the
-answer rather than a gap in it:
+A 7B model at Q8_0 fits, but only just, and only if the discrete GPU is not also
+drawing your desktop. On this laptop the dGPU was driving the panel directly
+(ASUS "Ultimate" / MUX mode), which permanently held ~580 MB of VRAM for the
+framebuffer and compositor. Switching to hybrid mode routes the display through
+the integrated GPU and hands that memory back:
 
-| Family | Weights | Required (+14% runtime) | Free VRAM | Verdict |
-| --- | --- | --- | --- | --- |
-| llama2 | 6829 MB | 7854 MB | 7339 MB | refused |
-| mistral | 7339 MB | 8440 MB | 7321 MB | refused |
-| qwen2.5 | 7723 MB | 8882 MB | 7312 MB | refused |
+| | dGPU drives display | Display on iGPU |
+| --- | --- | --- |
+| VRAM in use at idle | 578-985 MB | **0 MB** |
+| VRAM free | 7314 MB | **7891 MB** |
+| Q8_0 configurations measurable | 0 of 3 | **3 of 3** |
 
-The board has 8151 MB total with ~560 MB held by the desktop compositor. A 7B
-model at Q8_0 needs its weights plus KV cache, compute buffers and CUDA context;
-none of the three fits.
+The margins remain thin — 88 to 406 MB depending on family — so this is a
+boundary worth respecting rather than a comfortable fit. `vram_residency` is
+identical between each family's Q8_0 and its Q4_K_M row (0.98 / 0.98 / 0.93),
+which is the evidence that nothing is being paged.
 
-Earlier revisions of this harness *did* run them, and that is precisely the
-problem. A model larger than free VRAM still executes — the driver pages it —
-and returns a number that measures PCIe transfer rather than the model. Those
-numbers looked plausible and were bimodal and irreproducible, which is what
-started this whole investigation. Refusing to produce them is the fix.
+Two things make the difference between fitting and not, and neither is visible
+in file size:
 
-To measure Q8_0 at 7B you need a larger card. To characterize this one, the
-useful statement is the boundary itself.
+- **The KV cache is architectural, not proportional.** At 512 tokens it is
+  256 MB for Llama-2 (full multi-head attention, 32 KV heads over 32 layers)
+  and 28 MB for Qwen2.5 (4 KV heads over 28) — a 9x range at comparable file
+  sizes. Llama-2 has the smallest Q8_0 file and the least headroom.
+- **The embedding table never reaches the device.** llama.cpp keeps
+  `token_embd` on the host at full offload: 133 MB for a 32k vocabulary,
+  552 MB for Qwen2.5's 152k. Charging VRAM for it wrongly refused Qwen2.5 Q8_0
+  on a card where it fits with 159 MB to spare.
+
+Earlier revisions of this harness ran Q8_0 anyway, at a point where it did not
+fit, and that is what started this investigation. A model larger than free VRAM
+still executes — the driver pages it — and returns a number that measures PCIe
+transfer. Those numbers were bimodal and irreproducible. The harness now refuses
+rather than producing them.
+
+### Q8_0 rows were measured at a slightly lower clock
+
+Q4_K_M and Q5_K_M held P0 (12101 MHz) throughout. The Q8_0 rows averaged
+11561-11665 MHz, drifting between P0 and P2 across their runs — admitted because
+their throughput agreed to better than 1%, but a ~4% lower clock nonetheless.
+Cross-*quant* comparisons therefore carry a few percent of clock confound that
+within-quant comparisons do not, and the true Q4→Q8 falloff is marginally
+steeper than the table shows.
 
 ### Qwen2.5 keeps more weight on the host
 
@@ -333,11 +370,10 @@ comparisons at equal device-resident bytes.
 ### The remaining clock spread is bounded, not eliminated
 
 The card cannot be pinned to P0 under WDDM. What the harness guarantees is that
-every published run held at least P2 throughout and that runs aggregated
+every published run held at least P2 throughout, and that runs aggregated
 together agree with one another; it does not guarantee every run sat at exactly
-the same clock. Two rows in the table above were measured slightly above P2
-(11545 and 11141 MHz), so cross-*family* comparisons carry a residual
-uncertainty of a few percent. Within-family comparisons at 11101 MHz do not.
+the same clock. Six of the nine rows above held 12101 MHz exactly; the three
+Q8_0 rows did not, as noted above.
 
 ### The offload ladder needs re-running
 
@@ -357,8 +393,15 @@ are withheld entirely rather than republished with caveats.
 | **Python** | 3.14 |
 | **llama-cpp-python** | 0.3.20, built from source with `GGML_CUDA=on` |
 | **Host compiler** | MSVC 14.44 (Visual Studio Build Tools 2022) |
-| **Power profile** | Armory Crate Turbo — 108 W GPU ceiling (55 W default, 115 W max) |
+| **Power profile** | Armory Crate Turbo — 115 W GPU ceiling (55 W default) |
+| **GPU mode** | Hybrid — display driven by the integrated GPU, dGPU compute-only |
 
+> **Take the display off the discrete GPU.** On a MUX-equipped laptop, running
+> the dGPU as the display adapter costs ~580 MB of VRAM permanently and put
+> every Q8_0 configuration out of reach. Switching to hybrid mode (ASUS
+> "Standard", not "Eco" — that disables the dGPU entirely) requires a reboot and
+> costs nothing for compute: CUDA runs on the dGPU either way.
+>
 > **Laptop GPUs need the highest power profile.** Under WDDM the memory clock
 > cannot be locked, and a conservative profile leaves the card oscillating
 > between P-states mid-run. The harness will tell you: rows measured at an

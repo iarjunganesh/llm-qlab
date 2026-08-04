@@ -1,0 +1,143 @@
+C:\ws\llm-qlab main ❯ .\sweep_pass.ps1                                                                                                                                                                                                                                                                           19:10:25
+
+=== Preflight ===
+  [ok]   dGPU is not driving a display
+  [info] VRAM 7 891 MiB free of 8 151 (260 held)
+  [info] largest model Qwen2.5-7B-Instruct-Q8_0.gguf at 7 723 MB
+  [info] GPU power limit 115 W of 115 W max
+  [ok]   GPU idle (0% utilization)
+
+Preflight clean.
+
+=== Sweep: 9 configurations, 5 clean runs each ===
+Logs: results/logs/20260804-1910
+
+--- llama2 Q4_K_M  19:10:32 ---
+
+Geometry: 32 layers, 32/32 KV heads, head_dim 128 � KV cache 256 MB at n_ctx=512
+Warmed up after 13 runs (3 consecutive within 5% at full memory clock)
+  [accept] 74.54 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 73.45 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 74.43 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 73.70 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 74.46 t/s at 12101-12101 MHz (mean 12101)
+  Decode t/s       : 74.43 � 0.50
+  Timing source    : perf_counters
+--- llama2 Q5_K_M  19:11:15 ---
+Geometry: 32 layers, 32/32 KV heads, head_dim 128 � KV cache 256 MB at n_ctx=512
+Warmed up after 4 runs (3 consecutive within 5% at full memory clock)
+  [accept] 65.40 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 64.50 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 65.39 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 65.31 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 65.19 t/s at 12101-12101 MHz (mean 12101)
+  Decode t/s       : 65.31 � 0.37
+  Timing source    : perf_counters
+--- llama2 Q8_0  19:11:40 ---
+Geometry: 32 layers, 32/32 KV heads, head_dim 128 � KV cache 256 MB at n_ctx=512
+Warmed up after 4 runs (3 consecutive within 5% at full memory clock)
+  [accept] 45.76 t/s at 11101-12101 MHz (mean 11601)
+  [accept] 45.78 t/s at 11101-12101 MHz (mean 11501)
+  [accept] 45.78 t/s at 11101-12101 MHz (mean 11701)
+  [accept] 45.85 t/s at 11101-12101 MHz (mean 11601)
+  [accept] 45.59 t/s at 11101-12101 MHz (mean 11401)
+  Decode t/s       : 45.78 � 0.10
+  Timing source    : perf_counters
+--- mistral Q4_K_M  19:12:14 ---
+Geometry: 32 layers, 8/32 KV heads, head_dim 128 � KV cache 64 MB at n_ctx=512
+Warmed up after 4 runs (3 consecutive within 5% at full memory clock)
+  [accept] 71.18 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 71.06 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 71.11 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 71.19 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 71.19 t/s at 12101-12101 MHz (mean 12101)
+  Decode t/s       : 71.18 � 0.06
+  Timing source    : perf_counters
+--- mistral Q5_K_M  19:12:36 ---
+Geometry: 32 layers, 8/32 KV heads, head_dim 128 � KV cache 64 MB at n_ctx=512
+Warmed up after 4 runs (3 consecutive within 5% at full memory clock)
+  [accept] 62.17 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 62.30 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 62.05 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 61.48 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 62.26 t/s at 12101-12101 MHz (mean 12101)
+  Decode t/s       : 62.17 � 0.33
+  Timing source    : perf_counters
+--- mistral Q8_0  19:13:02 ---
+Geometry: 32 layers, 8/32 KV heads, head_dim 128 � KV cache 64 MB at n_ctx=512
+Warmed up after 4 runs (3 consecutive within 5% at full memory clock)
+  [accept] 43.18 t/s at 11101-12101 MHz (mean 11556)
+  [accept] 43.11 t/s at 11101-12101 MHz (mean 11646)
+  [accept] 43.17 t/s at 11101-12101 MHz (mean 11646)
+  [accept] 43.18 t/s at 11101-12101 MHz (mean 11646)
+  [accept] 42.79 t/s at 11101-12101 MHz (mean 11737)
+  Decode t/s       : 43.17 � 0.17
+  Timing source    : perf_counters
+--- qwen2.5 Q4_K_M  19:13:38 ---
+Geometry: 28 layers, 4/28 KV heads, head_dim 128 � KV cache 28 MB at n_ctx=512
+Warmed up after 4 runs (3 consecutive within 5% at full memory clock)
+  [accept] 71.79 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 71.34 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 71.79 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 71.69 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 71.38 t/s at 12101-12101 MHz (mean 12101)
+  Decode t/s       : 71.69 � 0.22
+  Timing source    : perf_counters
+--- qwen2.5 Q5_K_M  19:14:01 ---
+Geometry: 28 layers, 4/28 KV heads, head_dim 128 � KV cache 28 MB at n_ctx=512
+Warmed up after 4 runs (3 consecutive within 5% at full memory clock)
+  [accept] 63.06 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 62.66 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 63.23 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 63.15 t/s at 12101-12101 MHz (mean 12101)
+  [accept] 63.16 t/s at 12101-12101 MHz (mean 12101)
+  Decode t/s       : 63.15 � 0.23
+  Timing source    : perf_counters
+--- qwen2.5 Q8_0  19:14:27 ---
+Geometry: 28 layers, 4/28 KV heads, head_dim 128 � KV cache 28 MB at n_ctx=512
+Warmed up after 4 runs (3 consecutive within 5% at full memory clock)
+  [accept] 43.96 t/s at 11101-12101 MHz (mean 11646)
+  [accept] 43.97 t/s at 11101-12101 MHz (mean 11737)
+  [accept] 43.91 t/s at 11101-12101 MHz (mean 11646)
+  [accept] 43.65 t/s at 11101-12101 MHz (mean 11646)
+  [accept] 43.57 t/s at 11101-12101 MHz (mean 11646)
+  Decode t/s       : 43.91 � 0.19
+  Timing source    : perf_counters
+
+=== Regenerating charts ===
+[info] 12 superseded row(s) ignored — a newer measurement exists for the same configuration.
+Chart saved to results\comparison.png
+
+## Benchmark Results
+
+| Quant | Decode t/s | Prefill t/s | TTFT (ms) | VRAM (MB) | Load (s) | Size (MB) |
+|-------|------------|-------------|-----------|-----------|----------|-----------|
+| Q4_K_M | 71.69 | 2788.19 | 93.86 | 4480 | 2.54 | 4166 |
+| Q5_K_M | 63.15 | 2671.44 | 97.91 | 5192 | 3.28 | 4894 |
+| Q8_0 | 43.91 | 2829.01 | 92.59 | 7590 | 4.72 | 7339 |
+
+[info] 12 superseded row(s) ignored — a newer measurement exists for the same configuration.
+Chart saved to results\comparison_by_family.png
+
+## Benchmark Results by Model Family
+
+| Model Family | Quant | Decode t/s | Prefill t/s | TTFT (ms) | VRAM (MB) | Size (MB) |
+|--------------|-------|------------|-------------|-----------|-----------|-----------|
+| llama2 | Q4_K_M | 74.43 | 2788.19 | 93.86 | 4382 | 3892 |
+| llama2 | Q5_K_M | 65.31 | 2671.44 | 97.91 | 5036 | 4562 |
+| llama2 | Q8_0 | 45.78 | 2829.01 | 92.59 | 7256 | 6829 |
+| mistral | Q4_K_M | 71.18 | 2692.24 | 97.28 | 4480 | 4166 |
+| mistral | Q5_K_M | 62.17 | 2585.53 | 101.18 | 5192 | 4894 |
+| mistral | Q8_0 | 43.17 | 2708.80 | 96.77 | 7590 | 7339 |
+| qwen2.5 | Q4_K_M | 71.69 | 3355.53 | 78.32 | 4704 | 4466 |
+| qwen2.5 | Q5_K_M | 63.15 | 3269.73 | 80.21 | 5364 | 5193 |
+| qwen2.5 | Q8_0 | 43.91 | 3493.31 | 75.24 | 7700 | 7723 |
+
+
+=== Complete in 00:04:34 ===
+Rows by timing_source:
+  perf_counters                15
+  skipped_insufficient_vram    3
+  unstable_clocks              3
+
+Only perf_counters rows are published. Anything else was refused or flagged.

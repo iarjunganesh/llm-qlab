@@ -327,10 +327,16 @@ def plot_comparison_by_family(df: pd.DataFrame) -> None:
     ax.set_title("Decode Speed by Model Family")
     ax.set_xticks(list(x))
     ax.set_xticklabels(families)
-    ax.legend(title="Quant type")
+    # Figure-level and above the axes: an in-axes legend covered the tallest
+    # bar of the rightmost group once Q8_0 rows became measurable.
+    handles, labels_ = ax.get_legend_handles_labels()
+    fig.legend(handles, labels_, title="Quant type", frameon=False,
+               loc="upper center", bbox_to_anchor=(0.5, 0.93),
+               ncol=len(quants), fontsize=9)
+    ax.margins(y=0.12)
 
     _caption_for_empty(fig, empty_quants)
-    plt.tight_layout(rect=(0, 0.04 if empty_quants else 0, 1, 1))
+    plt.tight_layout(rect=(0, 0.04 if empty_quants else 0, 1, 0.88))
     plt.savefig(OUTPUT_PNG_FAMILY, dpi=150)
     print(f"Chart saved to {OUTPUT_PNG_FAMILY}")
 
