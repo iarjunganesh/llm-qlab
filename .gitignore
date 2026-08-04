@@ -48,5 +48,9 @@ linkedin-*.txt
 
 # Pasted terminal transcripts used while debugging a run. The logs under
 # results/logs/ are the durable record; these are scratch.
-*-terminal-output.txt
-ps-output*.txt
+#
+# Matched anywhere in the name rather than anchored at the start: an earlier
+# pattern of ps-output*.txt missed new-ps-output.txt, which was then committed.
+*ps-output*.txt
+*terminal-output*.txt
+*-running-output.txt

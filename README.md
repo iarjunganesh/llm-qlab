@@ -286,15 +286,36 @@ direction and magnitude across all three families.
 > on 2026-08-03. Almost none of that is a speedup — it is measurement conditions
 > that were previously uncontrolled and unrecorded.
 
-### GPU offload ladder — withheld pending re-measurement
+### GPU offload ladder
 
-The ladder was last measured under a harness revision with neither the
-VRAM-release fix nor clock verification, so those numbers carry both defects
-and are not republished. `results/offload_ladder.csv` is not shipped. The sweep
-needs a full re-run.
+Q4_K_M, `n_gpu_layers` swept 0 to 99, median of 3 clock-verified runs per step.
+Full per-step data in `results/offload_ladder.csv`.
 
-Two structural findings from that work do survive, because they are properties
-of the models and the loader rather than of the timing path:
+| Layers | llama2 | mistral | qwen2.5 | Weights on host (llama2) |
+| --- | --- | --- | --- | --- |
+| 0 | 11.93 ± 0.06 | 11.83 ± 0.05 | 11.69 ± 0.02 | everything |
+| 8 | 14.18 ± 0.25 | 14.35 ± 0.06 | 15.54 ± 0.24 | 3055 MB |
+| 16 | 19.12 ± 0.16 | 18.51 ± 0.03 | 20.78 ± 0.12 | 2829 MB |
+| 24 | 27.17 ± 0.19 | 26.57 ± 0.21 | 35.55 ± 0.31 | 2720 MB |
+| 32 | ⚠️ 47.5 ± 4.73 | 61.05 ± 0.16 | 71.06 ± 0.33 | 194 MB |
+| 99 | 74.29 ± 0.13 | 70.91 ± 0.44 | ⚠️ 71.05 ± 0.47 | none |
+
+⚠️ = not clock-verified, excluded from the chart. See below.
+
+![GPU offload ladder](results/offload_ladder.png)
+
+**The curve is sharply non-linear, and that is the finding.** Moving three
+quarters of Llama-2 onto the GPU gets you from 11.9 to 27.2 t/s. Moving the last
+quarter takes you to 74.3. Any layer left on the host forces a PCIe round trip
+on *every token*, so a single straggler bottlenecks the whole pipeline — you do
+not get proportional benefit, you get almost nothing until nearly everything is
+resident. Full offload is **6.2x** CPU-only.
+
+This is the practical answer to "my model nearly fits — how much do I lose
+offloading part of it?" The answer is: much more than the fraction suggests.
+
+Two structural findings, properties of the models and the loader rather than of
+the timing path:
 
 - **The x-axis is not comparable across families.** Llama-2 and Mistral have 32
   transformer layers; Qwen2.5-7B has 28. So `n_gpu_layers=16` is half of one
@@ -302,8 +323,24 @@ of the models and the loader rather than of the timing path:
   while the others still have layers on the host.
 - **llama.cpp counts the output layer separately.** For a 32-layer model,
   `n_gpu_layers=32` leaves that layer on CPU; only 33+ offloads everything.
-  That is the 32 → 99 step visible for Llama-2 and Mistral (+~130 MB VRAM) and
-  absent for Qwen.
+  Llama-2 gains 56% and Mistral 16% from that single step. Qwen2.5 is flat
+  (71.06 → 71.05) because with 28 layers it is already complete at 32 — the
+  clearest confirmation that the x-axis means different things per family.
+
+### Two ladder steps are not published
+
+**`llama2` at 32 layers varies 47–60 t/s across three separate runs.** Mistral
+is stable at the same step (61.05 ± 0.16) with a comparable 203 MB left on host
+against Llama-2's 194 MB, so the configuration shape is not the difference. The
+likely cause is the KV cache: Llama-2 uses full multi-head attention and needs
+256 MB where Mistral's grouped-query attention needs 64 MB, putting Llama-2
+under real memory pressure at exactly the point where almost everything else is
+resident. Reproducible instability, reported rather than averaged away.
+
+**`qwen2.5` at 99 layers collected only one clean run** before the board went
+busy. Its value agrees with both its own 32-layer step and the quantization
+sweep's 71.70, so nothing here is in doubt — it simply is not verified to the
+standard the other rows meet.
 
 ---
 
@@ -485,11 +522,11 @@ python monitor_gpu.py --interval 1              # live GPU stats, separate termi
 | [`compare_quants.py`](compare_quants.py) | Charts + markdown tables | `--group-by` (`quant_type` \| `model_family`) |
 | [`monitor_gpu.py`](monitor_gpu.py) | Live GPU stats logger | `--interval` · `--output` |
 | [`download_model.py`](download_model.py) | Fetch GGUF models | `--model` · `--filename` · `--list` |
-| [`bench_core.py`](bench_core.py) | Shared measurement logic | *imported, not run directly* |
-| [`results_schema.py`](results_schema.py) | CSV schema + migration | *imported, not run directly* |
-| [`sweep_pass.ps1`](sweep_pass.ps1) | One full 9-configuration sweep | *no arguments* |
+| [`llm_qlab/bench_core.py`](llm_qlab/bench_core.py) | Shared measurement logic | *imported, not run directly* |
+| [`llm_qlab/results_schema.py`](llm_qlab/results_schema.py) | CSV schema + migration | *imported, not run directly* |
+| [`sweep_pass.ps1`](sweep_pass.ps1) | Preflight + full sweep + ladder + charts | `-SkipLadder` · `-Runs` · `-Force` |
 
-**Two design constraints worth naming.** `benchmark.py` and `offload_ladder.py` both delegate to `bench_core.benchmark_model`, so the two entry points cannot drift apart in methodology — a bug fixed in one is fixed in both. And `results_schema.py` deliberately imports no `llama_cpp`, so `compare_quants.py` runs anywhere: you do not need a CUDA build just to plot results someone else measured.
+**Three design constraints worth naming.** `benchmark.py` and `offload_ladder.py` both delegate to `llm_qlab.bench_core.benchmark_model`, so the two entry points cannot drift apart in methodology — a bug fixed in one is fixed in both. `llm_qlab.results_schema` deliberately imports no `llama_cpp`, so `compare_quants.py` runs anywhere: you do not need a CUDA build just to plot results someone else measured. And the CLI entry points stay at the repository root rather than moving into the package, because every command in this README invokes them directly and relocating them would break the documented interface to gain nothing.
 
 ---
 
@@ -528,13 +565,18 @@ llm-qlab/
 ├── compare_quants.py     # CLI: charts + markdown tables
 ├── monitor_gpu.py        # CLI: live GPU stats
 ├── download_model.py     # CLI: GGUF fetcher
-├── bench_core.py         # Measurement logic — shared by both benchmark CLIs
-├── results_schema.py     # CSV schema + migration (no llama_cpp dependency)
-├── sweep_pass.ps1        # Driver: one full 9-configuration sweep
-├── test_clock_gate.py    # Clock-state admission and rejection
-├── test_results_schema.py# Schema migration across every generation
-├── test_dedup.py         # Superseded-row collapsing
+├── sweep_pass.ps1        # Driver: preflight, full sweep, offload ladder, charts
+├── llm_qlab/
+│   ├── bench_core.py     # Measurement logic — shared by both benchmark CLIs
+│   └── results_schema.py # CSV schema + migration (no llama_cpp dependency)
+├── tests/
+│   ├── test_clock_gate.py     # Clock-state admission and rejection
+│   ├── test_vram_estimate.py  # KV cache and embedding-table sizing
+│   ├── test_results_schema.py # Schema migration across every generation
+│   └── test_dedup.py          # Superseded-row collapsing
+├── pyproject.toml        # pytest configuration
 ├── requirements.txt
+├── LICENSE
 └── results/
     ├── benchmark_results.csv    # published measurements (tracked)
     ├── comparison.png           # generated chart
