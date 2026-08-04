@@ -20,6 +20,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 from llm_qlab.bench_core import DEFAULT_PROMPT, benchmark_model
+from llm_qlab.theme import THEMES, categorical_map, ink_legend, themed_path
 
 
 # ---------------------------------------------------------------------------
@@ -137,16 +138,8 @@ def print_ladder_summary(model_name: str, quant_type: str, rows: list[dict]) -> 
 # Plot
 # ---------------------------------------------------------------------------
 
-SURFACE = "#fcfcfb"
-INK = "#1a1a19"
-MUTED = "#5c5c5a"
-# Same validated categorical slots the comparison charts use, so a family keeps
-# one identity across every figure in the repo.
-CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
-
-
 def plot_ladder(quant_type: str, rows: list[dict]) -> None:
-    """Small multiples over a shared x-axis — one measure per panel.
+    """Small multiples over a shared x-axis — one measure per panel, per mode.
 
     Every model family present in *rows* is drawn as its own series, so a
     single figure answers "does offload behave the same across architectures".
@@ -157,10 +150,17 @@ def plot_ladder(quant_type: str, rows: list[dict]) -> None:
     infer a relationship that isn't in the data. Stacked panels sharing the
     x-axis show the same correlation without inventing one.
     """
+    for theme in THEMES.values():
+        _plot_ladder_themed(quant_type, rows, theme)
+
+
+def _plot_ladder_themed(quant_type: str, rows: list[dict], theme) -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
 
     families = sorted({r["model_family"] for r in rows})
-    colors = {f: CATEGORICAL[i % len(CATEGORICAL)] for i, f in enumerate(families)}
+    # Shared with the comparison charts, so a family keeps one identity across
+    # every figure in the repo — and keeps it in both modes.
+    colors = categorical_map(theme, families)
     # Even spacing: the ladder steps are ordinal, and a linear axis squeezes
     # 0-32 into a third of the width just because the last step is 99.
     steps = sorted({int(r["n_gpu_layers"]) for r in rows})
@@ -173,11 +173,11 @@ def plot_ladder(quant_type: str, rows: list[dict]) -> None:
     ]
 
     fig, axes = plt.subplots(
-        len(panels), 1, figsize=(10, 10), sharex=True, facecolor=SURFACE
+        len(panels), 1, figsize=(10, 10), sharex=True, facecolor=theme["surface"]
     )
 
     for ax, (title, unit, col, err_col, fmt) in zip(axes, panels):
-        ax.set_facecolor(SURFACE)
+        ax.set_facecolor(theme["surface"])
         hi, lo = float("-inf"), float("inf")
 
         for fam in families:
@@ -189,8 +189,8 @@ def plot_ladder(quant_type: str, rows: list[dict]) -> None:
 
             ax.errorbar(
                 xs, values, yerr=errs if err_col else None, marker="o", markersize=7,
-                linewidth=2, color=colors[fam], capsize=3, ecolor="#8a8a87",
-                elinewidth=1, markeredgecolor=SURFACE, markeredgewidth=1.5, label=fam,
+                linewidth=2, color=colors[fam], capsize=3, ecolor=theme["error"],
+                elinewidth=1, markeredgecolor=theme["surface"], markeredgewidth=1.5, label=fam,
             )
             hi = max(hi, max(v + e for v, e in zip(values, errs)))
             lo = min(lo, min(v - e for v, e in zip(values, errs)))
@@ -202,39 +202,42 @@ def plot_ladder(quant_type: str, rows: list[dict]) -> None:
                 for idx in (0, len(values) - 1):
                     ax.annotate(fmt.format(values[idx]), (xs[idx], values[idx] + errs[idx]),
                                 textcoords="offset points", xytext=(0, 7), ha="center",
-                                fontsize=8, color=INK)
+                                fontsize=8, color=theme["ink"])
 
         span = (hi - lo) or 1.0
-        ax.set_title(f"{title} ({unit})", color=INK, fontsize=11, loc="left")
-        ax.grid(axis="y", color="#e4e4e1", linewidth=0.8)
+        ax.set_title(f"{title} ({unit})", color=theme["ink"], fontsize=11, loc="left")
+        ax.grid(axis="y", color=theme["grid"], linewidth=0.8)
         ax.set_axisbelow(True)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
         for side in ("left", "bottom"):
-            ax.spines[side].set_color("#c9c9c5")
-        ax.tick_params(colors=MUTED, length=0)
+            ax.spines[side].set_color(theme["axis"])
+        ax.tick_params(colors=theme["muted"], length=0)
         # Bound the view to data *including* error bars — clipping a whisker
         # hides exactly the variance the error bar exists to show.
         ax.set_ylim(lo - span * 0.12, hi + span * 0.18)
 
     axes[-1].set_xticks(range(len(steps)))
     axes[-1].set_xticklabels([str(s) for s in steps])
-    axes[-1].set_xlabel("n_gpu_layers (layers offloaded to GPU)", color=MUTED)
+    axes[-1].set_xlabel("n_gpu_layers (layers offloaded to GPU)", color=theme["muted"])
 
     if len(families) > 1:
         handles, labels_ = axes[0].get_legend_handles_labels()
-        fig.legend(handles, labels_, title="Model family", frameon=False,
-                   loc="upper center", bbox_to_anchor=(0.5, 0.945),
-                   ncol=len(families), fontsize=9)
+        legend = fig.legend(handles, labels_, title="Model family", frameon=False,
+                            loc="upper center", bbox_to_anchor=(0.5, 0.945),
+                            ncol=len(families), fontsize=9)
+        ink_legend(legend, theme)
 
     n_runs = rows[0].get("n_runs", 0) if rows else 0
     fig.suptitle(
         f"GPU offload ladder — {quant_type} (median of {n_runs} runs)",
-        fontsize=14, fontweight="bold", color=INK,
+        fontsize=14, fontweight="bold", color=theme["ink"],
     )
     fig.tight_layout(rect=(0, 0, 1, 0.92 if len(families) > 1 else 0.97))
-    plt.savefig(PLOT_PATH, dpi=150, facecolor=SURFACE)
-    print(f"[ladder] Plot saved to {PLOT_PATH}")
+    out = themed_path(PLOT_PATH, theme)
+    plt.savefig(out, dpi=150, facecolor=theme["surface"])
+    plt.close(fig)
+    print(f"[ladder] Plot saved to {out}")
 
 
 # ---------------------------------------------------------------------------

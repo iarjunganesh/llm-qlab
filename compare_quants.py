@@ -27,6 +27,9 @@ from llm_qlab.results_schema import (
     CSV_FIELDS, CSV_PATH, LEGACY_MARKER, SKIPPED_MARKER, UNSTABLE_MARKER,
     normalize_row,
 )
+from llm_qlab.theme import (
+    THEMES, categorical_map, ink_legend, ordinal_ramp, themed_path,
+)
 
 # None of these denotes a publishable measurement, for three different reasons:
 # legacy rows were timed by a broken path, unstable rows were timed correctly
@@ -43,13 +46,9 @@ RESULTS_DIR = Path("results")
 OUTPUT_PNG = RESULTS_DIR / "comparison.png"
 OUTPUT_PNG_FAMILY = RESULTS_DIR / "comparison_by_family.png"
 
-# Categorical slots 1-3, validated for colourblind separation against the light
-# chart surface (worst adjacent pair ΔE 9.2 deutan / 27.6 normal). The aqua slot
-# sits below 3:1 contrast, so every bar carries a direct value label.
-CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#4a3aa7"]
-SURFACE = "#fcfcfb"
-INK = "#1a1a19"
-MUTED = "#5c5c5a"
+# Palettes, surfaces and both ordinal ramps live in llm_qlab.theme so this file
+# and offload_ladder.py cannot drift into different-looking figures. Every chart
+# is rendered once per mode; see THEMES there for the validation figures.
 
 # Quantization is ordinal — keep charts in bit-depth order, not discovery order.
 QUANT_ORDER = ["Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M",
@@ -209,7 +208,7 @@ def _split_plottable(agg: pd.DataFrame, value_col: str = "decode_tps") -> tuple[
     return plottable, empty
 
 
-def _caption_for_empty(fig, empty: list[str]) -> None:
+def _caption_for_empty(fig, empty: list[str], theme) -> None:
     """Note omitted quant formats beneath the axes."""
     if not empty:
         return
@@ -217,7 +216,7 @@ def _caption_for_empty(fig, empty: list[str]) -> None:
         0.5, 0.015,
         f"{', '.join(empty)} omitted — exceeds available VRAM on this hardware; "
         "see README, Known issues.",
-        ha="center", fontsize=8, color=MUTED, style="italic",
+        ha="center", fontsize=8, color=theme["muted"], style="italic",
     )
 
 
@@ -225,53 +224,7 @@ def _caption_for_empty(fig, empty: list[str]) -> None:
 # Plotting
 # ---------------------------------------------------------------------------
 
-# Blue ramp steps 250..650, the band legal for an *ordinal* encoding on this
-# light surface. Quantization format is ordinal, not nominal: Q4_K_M, Q5_K_M and
-# Q8_0 are size tiers, and reordering them would change the meaning. A one-hue
-# ramp puts that order in the colour; categorical hues would spend the identity
-# channel and throw the ordering away.
-#
-# The band matters. Lighter steps exist (200 = #9ec5f4) and are legal for a
-# continuous sequential scale, where the lightest value means "near zero" and may
-# recede into the surface. An ordinal mark must stay visible: step 200 measures
-# 1.74:1 against this surface, under the 2:1 floor. An earlier revision indexed
-# a hardcoded list from the dark end, which happened to avoid step 200 at three
-# quant formats and would have selected it at four.
-ORDINAL_BLUE = [
-    "#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6",
-    "#256abf", "#1c5cab", "#184f95", "#104281",
-]
-
-
-# Above this the band cannot supply steps that stay 0.06 apart in lightness, so
-# adjacent formats stop being separable. This is a property of the ramp, not a
-# thing to tune away: at six or more formats the answer is small multiples, not
-# finer steps nobody can tell apart.
-MAX_ORDINAL_STEPS = 5
-
-
-def _ordinal_ramp(n: int) -> list[str]:
-    """Evenly spaced steps across the ordinal band, light to dark."""
-    if n <= 1:
-        return [ORDINAL_BLUE[len(ORDINAL_BLUE) // 2]]
-    if n > MAX_ORDINAL_STEPS:
-        print(f"[warn] {n} quantization formats exceeds the {MAX_ORDINAL_STEPS} "
-              "the ordinal ramp can keep visually distinct — adjacent formats "
-              "will be hard to tell apart. Consider faceting.")
-    last = len(ORDINAL_BLUE) - 1
-    return [ORDINAL_BLUE[round(i * last / (n - 1))] for i in range(n)]
-
-
-def _family_colors(families: list[str]) -> dict[str, str]:
-    """Map each family to a fixed categorical slot.
-
-    Keyed on the sorted family name rather than row order, so filtering the
-    data cannot repaint the surviving series — colour follows the entity.
-    """
-    return {fam: CATEGORICAL[i % len(CATEGORICAL)] for i, fam in enumerate(sorted(families))}
-
-
-def _grouped_bars(ax, agg, families, quants, colors, value_col, err_col, fmt):
+def _grouped_bars(ax, agg, families, quants, colors, value_col, err_col, fmt, theme):
     """Draw one grouped-bar panel: quant on x, one coloured bar per family."""
     # 2px surface gap between adjacent bars at 150 dpi.
     slot = 0.8 / len(families)
@@ -290,9 +243,9 @@ def _grouped_bars(ax, agg, families, quants, colors, value_col, err_col, fmt):
         positions = [xi + offset for xi in range(len(quants))]
         ax.bar(
             positions, values, width=bar_width, label=fam,
-            color=colors[fam], edgecolor=SURFACE, linewidth=0.5,
+            color=colors[fam], edgecolor=theme["surface"], linewidth=0.5,
             yerr=errors if any(errors) else None, capsize=3,
-            error_kw={"elinewidth": 1, "ecolor": "#5c5c5a"},
+            error_kw={"elinewidth": 1, "ecolor": theme["error"]},
         )
         # Direct labels satisfy the relief requirement for the low-contrast slot.
         # Sit them above the error-bar cap, not the bar top, or they collide.
@@ -300,20 +253,20 @@ def _grouped_bars(ax, agg, families, quants, colors, value_col, err_col, fmt):
         for px, v, e in zip(positions, values, errors):
             if v > 0:
                 ax.text(px, v + e + span * 0.02, fmt.format(v),
-                        ha="center", va="bottom", fontsize=7, color=INK)
+                        ha="center", va="bottom", fontsize=7, color=theme["ink"])
 
     ax.set_xticks(range(len(quants)))
     ax.set_xticklabels(quants)
-    ax.grid(axis="y", color="#e4e4e1", linewidth=0.8)
+    ax.grid(axis="y", color=theme["grid"], linewidth=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
-    ax.spines["bottom"].set_color("#c9c9c5")
-    ax.tick_params(colors=MUTED, length=0)
+    ax.spines["bottom"].set_color(theme["axis"])
+    ax.tick_params(colors=theme["muted"], length=0)
     ax.margins(y=0.18)
 
 
-def plot_comparison(df: pd.DataFrame) -> None:
+def plot_comparison(df: pd.DataFrame, theme) -> None:
     """Decode throughput and VRAM, every family shown side by side per quant."""
     RESULTS_DIR.mkdir(exist_ok=True)
     agg = _aggregate(df, ["model_family", "quant_type"])
@@ -323,39 +276,44 @@ def plot_comparison(df: pd.DataFrame) -> None:
     if not quants:
         print("[error] No quantization format has plottable data.")
         sys.exit(1)
-    colors = _family_colors(families)
+    colors = categorical_map(theme, families)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor=SURFACE)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), facecolor=theme["surface"])
     fig.suptitle("LLM Quantization Comparison — llm-qlab", fontsize=14,
-                 fontweight="bold", color=INK)
+                 fontweight="bold", color=theme["ink"])
 
     for ax in axes:
-        ax.set_facecolor(SURFACE)
+        ax.set_facecolor(theme["surface"])
 
-    _grouped_bars(axes[0], agg, families, quants, colors, "decode_tps", "decode_tps_std", "{:.1f}")
-    axes[0].set_title("Decode speed (tokens/sec)", color=INK, fontsize=11)
-    axes[0].set_xlabel("Quantization format", color=MUTED)
-    axes[0].set_ylabel("Tokens / second", color=MUTED)
+    _grouped_bars(axes[0], agg, families, quants, colors,
+                  "decode_tps", "decode_tps_std", "{:.1f}", theme)
+    axes[0].set_title("Decode speed (tokens/sec)", color=theme["ink"], fontsize=11)
+    axes[0].set_xlabel("Quantization format", color=theme["muted"])
+    axes[0].set_ylabel("Tokens / second", color=theme["muted"])
 
-    _grouped_bars(axes[1], agg, families, quants, colors, "vram_delta_mb", None, "{:.0f}")
-    axes[1].set_title("VRAM attributable to model (MB)", color=INK, fontsize=11)
-    axes[1].set_xlabel("Quantization format", color=MUTED)
-    axes[1].set_ylabel("VRAM (MB)", color=MUTED)
+    _grouped_bars(axes[1], agg, families, quants, colors,
+                  "vram_delta_mb", None, "{:.0f}", theme)
+    axes[1].set_title("VRAM attributable to model (MB)", color=theme["ink"], fontsize=11)
+    axes[1].set_xlabel("Quantization format", color=theme["muted"])
+    axes[1].set_ylabel("VRAM (MB)", color=theme["muted"])
 
     # Legend is mandatory for >= 2 series; identity is never colour-alone.
     # Figure-level and above the panels, so it never covers a bar.
     handles, labels_ = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels_, title="Model family", frameon=False,
-               loc="upper center", bbox_to_anchor=(0.5, 0.93),
-               ncol=len(families), fontsize=9)
+    legend = fig.legend(handles, labels_, title="Model family", frameon=False,
+                        loc="upper center", bbox_to_anchor=(0.5, 0.93),
+                        ncol=len(families), fontsize=9)
+    ink_legend(legend, theme)
 
-    _caption_for_empty(fig, empty_quants)
+    _caption_for_empty(fig, empty_quants, theme)
     plt.tight_layout(rect=(0, 0.04 if empty_quants else 0, 1, 0.88))
-    plt.savefig(OUTPUT_PNG, dpi=150, facecolor=SURFACE)
-    print(f"Chart saved to {OUTPUT_PNG}")
+    out = themed_path(OUTPUT_PNG, theme)
+    plt.savefig(out, dpi=150, facecolor=theme["surface"])
+    plt.close(fig)
+    print(f"Chart saved to {out}")
 
 
-def plot_comparison_by_family(df: pd.DataFrame) -> None:
+def plot_comparison_by_family(df: pd.DataFrame, theme) -> None:
     """Grouped bar chart: model families on X-axis, one bar per quant type."""
     RESULTS_DIR.mkdir(exist_ok=True)
     agg = _aggregate(df, ["model_family", "quant_type"])
@@ -368,12 +326,13 @@ def plot_comparison_by_family(df: pd.DataFrame) -> None:
     bar_width = 0.8 / len(quants)
     x = range(len(families))
 
-    fig, ax = plt.subplots(figsize=(max(8, len(families) * 2), 5), facecolor=SURFACE)
-    ax.set_facecolor(SURFACE)
+    fig, ax = plt.subplots(figsize=(max(8, len(families) * 2), 5),
+                           facecolor=theme["surface"])
+    ax.set_facecolor(theme["surface"])
     fig.suptitle("Decode t/s by Model Family — llm-qlab", fontsize=14,
-                 fontweight="bold", color=INK)
+                 fontweight="bold", color=theme["ink"])
 
-    colors = _ordinal_ramp(len(quants))
+    colors = ordinal_ramp(theme, len(quants))
     for i, quant in enumerate(quants):
         subset = agg[agg["quant_type"] == quant]
         values, errors = [], []
@@ -386,31 +345,42 @@ def plot_comparison_by_family(df: pd.DataFrame) -> None:
         offset = (i - len(quants) / 2) * bar_width + bar_width / 2
         bars = ax.bar(
             [xi + offset for xi in x], values, width=bar_width, label=quant,
-            color=colors[i % len(colors)], edgecolor="white",
-            yerr=errors, capsize=3,
+            color=colors[i % len(colors)], edgecolor=theme["surface"],
+            linewidth=0.5, yerr=errors, capsize=3,
+            error_kw={"elinewidth": 1, "ecolor": theme["error"]},
         )
         for bar, v in zip(bars, values):
             if v > 0:
                 ax.text(bar.get_x() + bar.get_width() / 2, v + 0.3,
-                        f"{v:.1f}", ha="center", va="bottom", fontsize=7)
+                        f"{v:.1f}", ha="center", va="bottom", fontsize=7,
+                        color=theme["ink"])
 
-    ax.set_xlabel("Model Family")
-    ax.set_ylabel("Tokens / second")
-    ax.set_title("Decode Speed by Model Family")
+    ax.set_xlabel("Model Family", color=theme["muted"])
+    ax.set_ylabel("Tokens / second", color=theme["muted"])
+    ax.set_title("Decode Speed by Model Family", color=theme["ink"])
     ax.set_xticks(list(x))
     ax.set_xticklabels(families)
+    ax.grid(axis="y", color=theme["grid"], linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(theme["axis"])
+    ax.tick_params(colors=theme["muted"], length=0)
     # Figure-level and above the axes: an in-axes legend covered the tallest
     # bar of the rightmost group once Q8_0 rows became measurable.
     handles, labels_ = ax.get_legend_handles_labels()
-    fig.legend(handles, labels_, title="Quant type", frameon=False,
-               loc="upper center", bbox_to_anchor=(0.5, 0.93),
-               ncol=len(quants), fontsize=9)
+    legend = fig.legend(handles, labels_, title="Quant type", frameon=False,
+                        loc="upper center", bbox_to_anchor=(0.5, 0.93),
+                        ncol=len(quants), fontsize=9)
+    ink_legend(legend, theme)
     ax.margins(y=0.12)
 
-    _caption_for_empty(fig, empty_quants)
+    _caption_for_empty(fig, empty_quants, theme)
     plt.tight_layout(rect=(0, 0.04 if empty_quants else 0, 1, 0.88))
-    plt.savefig(OUTPUT_PNG_FAMILY, dpi=150)
-    print(f"Chart saved to {OUTPUT_PNG_FAMILY}")
+    out = themed_path(OUTPUT_PNG_FAMILY, theme)
+    plt.savefig(out, dpi=150, facecolor=theme["surface"])
+    plt.close(fig)
+    print(f"Chart saved to {out}")
 
 
 # ---------------------------------------------------------------------------
@@ -476,11 +446,18 @@ def main() -> None:
         print("[error] No rows with valid timing data. Re-run benchmark.py.")
         sys.exit(1)
 
+    # Rendered once per mode. A PNG cannot respond to the viewer's theme, so
+    # both files are written and the README picks between them with a
+    # <picture> element keyed on prefers-color-scheme.
+    for theme in THEMES.values():
+        if args.group_by == "model_family":
+            plot_comparison_by_family(df, theme)
+        else:
+            plot_comparison(df, theme)
+
     if args.group_by == "model_family":
-        plot_comparison_by_family(df)
         print_markdown_table_by_family(df)
     else:
-        plot_comparison(df)
         print_markdown_table(df)
 
 

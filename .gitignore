@@ -46,6 +46,10 @@ results/*.pre-rerun-*.csv
 linkedin-*.txt
 *-recruiter-*.txt
 
+# Social-media assets composed from the published charts. Derived, not source:
+# regenerate with ffmpeg from results/*-light.png and results/*-dark.png.
+results/linkedin-card-*.png
+
 # Pasted terminal transcripts used while debugging a run. The logs under
 # results/logs/ are the durable record; these are scratch.
 #

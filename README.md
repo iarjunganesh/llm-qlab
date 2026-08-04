@@ -247,7 +247,10 @@ All nine configurations measured cleanly, including Q8_0 — which required
 taking the display off the discrete GPU. See
 [fitting Q8_0 on 8 GB](#fitting-q8_0-on-an-8-gb-card).
 
-![Quantization comparison](results/comparison.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/comparison-dark.png">
+  <img alt="Quantization comparison" src="results/comparison-light.png">
+</picture>
 
 **Prefill runs 40-75x decode.** Prefill processes the prompt in parallel and is
 compute-bound; decode emits one token at a time and is memory-bandwidth-bound.
@@ -302,7 +305,10 @@ Full per-step data in `results/offload_ladder.csv`.
 
 ⚠️ = not clock-verified, excluded from the chart. See below.
 
-![GPU offload ladder](results/offload_ladder.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/offload_ladder-dark.png">
+  <img alt="GPU offload ladder" src="results/offload_ladder-light.png">
+</picture>
 
 **The curve is sharply non-linear, and that is the finding.** Moving three
 quarters of Llama-2 onto the GPU gets you from 11.9 to 27.2 t/s. Moving the last
@@ -579,8 +585,8 @@ llm-qlab/
 ├── LICENSE
 └── results/
     ├── benchmark_results.csv    # published measurements (tracked)
-    ├── comparison.png           # generated chart
-    ├── comparison_by_family.png # generated chart
+    ├── comparison-light.png     # generated chart (light + dark variants)
+    ├── comparison_by_family-*.png
     ├── logs/                    # per-run stdout (git-ignored)
     └── archive/                 # superseded sweeps (git-ignored)
 ```
