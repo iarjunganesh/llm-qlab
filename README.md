@@ -276,6 +276,17 @@ nine rows, no exceptions. This is the check the previous sweep failed: Qwen2.5
 Q5_K_M decoded *faster* than its own Q4_K_M despite being 16% larger, and did so
 reproducibly across two passes. That inversion is gone; it was a clock artifact.
 
+Grouped by family, the ordering is easier to read than in the table — three
+descending triples, no crossings:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/comparison_by_family-dark.png">
+  <img alt="Decode throughput by model family, one bar per quantization format" src="results/comparison_by_family-light.png">
+</picture>
+
+Regenerate both views with `python compare_quants.py` and
+`python compare_quants.py --group-by model_family`.
+
 Effective bandwidth is not perfectly flat — it rises 5-7% from Q4_K_M to Q8_0.
 Two candidate explanations, neither yet tested: fixed per-token cost (sampling,
 kernel launch, the Python loop) is amortized better at 44 t/s than at 74, and
@@ -418,10 +429,13 @@ together agree with one another; it does not guarantee every run sat at exactly
 the same clock. Six of the nine rows above held 12101 MHz exactly; the three
 Q8_0 rows did not, as noted above.
 
-### The offload ladder needs re-running
+### Two offload-ladder steps are not clock-verified
 
-Ladder numbers predate both the VRAM-release fix and clock verification, so they
-are withheld entirely rather than republished with caveats.
+The ladder was re-run under the current harness, and 16 of its 18 steps are
+published. `llama2` at 32 layers and `qwen2.5` at 99 layers are not: both carry
+`timing_source = unstable_clocks` and are excluded from the chart. They are
+listed with their values and the reasoning in
+[the ladder section](#two-ladder-steps-are-not-published) rather than dropped.
 
 ---
 
@@ -607,7 +621,7 @@ local.
 | ✅ | Model-attributable VRAM measurement |
 | ✅ | Tensor placement read from llama.cpp's own loader accounting |
 | ✅ | GPU clock-state verification, per-run rejection and recording |
-| ◻️ | Re-run the GPU offload ladder under the current harness |
+| ✅ | GPU offload ladder re-run under the current harness, three families |
 | ◻️ | Batch-size and context-length sweeps (throughput under concurrency) |
 | ◻️ | Quality regression alongside speed — perplexity per quantization format |
 | ◻️ | Second hardware axis: datacenter GPU comparison |
